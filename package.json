@@ -1,0 +1,15 @@
+{
+  "name": "production-hub-sms",
+  "version": "1.0.0",
+  "description": "Church production team AI assistant via SMS",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
