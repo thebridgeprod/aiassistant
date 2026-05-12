@@ -420,16 +420,113 @@ async function sendWeeklySummary(overrideChannel) {
   }
 }
 
-// ─── Schedule: run every Thursday at 8am Central (14:00 UTC) ─────────────────
+// ─── Wednesday summary ───────────────────────────────────────────────────────
+async function sendWednesdaySummary(overrideChannel) {
+  console.log("Running Wednesday Production summary...");
+  try {
+    const today = new Date();
+    const daysUntilWed = (3 - today.getDay() + 7) % 7 || 7;
+    const nextWed = new Date(today);
+    nextWed.setDate(today.getDate() + daysUntilWed);
+    const wedDate = nextWed.toISOString().split("T")[0];
+
+    const sts = await getTargetServiceTypes();
+    const wedServiceTypes = sts.filter((s) =>
+      s.attributes.name === "Midweek Experience" || s.attributes.name === "Bridge Youth"
+    );
+
+    if (!wedServiceTypes.length) {
+      console.log("Wednesday summary: No midweek service types found");
+      return;
+    }
+
+    let msg = "Good morning! Here is your Production Team summary for this Wednesday.
+
+";
+
+    for (const st of wedServiceTypes) {
+      const plansData = await pcFetch(
+        "/services/v2/service_types/" + st.id + "/plans?filter=future&order=sort_date&per_page=5"
+      );
+      const plans = plansData.data || [];
+      if (!plans.length) {
+        msg += st.attributes.name + ": No upcoming plans found.
+
+";
+        continue;
+      }
+
+      const hintDate = new Date(wedDate);
+      let targetPlan = plans[0];
+      let closest = Infinity;
+      for (const plan of plans) {
+        const diff = Math.abs(new Date(plan.attributes.sort_date) - hintDate);
+        if (diff < closest) { closest = diff; targetPlan = plan; }
+      }
+
+      const p = targetPlan.attributes;
+      const team = await getProductionMembers(st.id, targetPlan.id);
+
+      const confirmed   = team.filter((m) => m.attributes.status === "C");
+      const unconfirmed = team.filter((m) => m.attributes.status === "U");
+      const declined    = team.filter((m) => m.attributes.status === "D");
+
+      msg += st.attributes.name + " — " + (p.title || "Service") + "
+";
+      msg += "Date: " + fmtDateLong(p.sort_date) + "
+";
+      msg += confirmed.length + " confirmed, " + unconfirmed.length + " pending, " + declined.length + " declined
+
+";
+
+      if (confirmed.length) {
+        msg += "CONFIRMED:
+" + confirmed.map((m) => "  " + m.attributes.team_position_name + ": " + m.attributes.name).join("
+") + "
+
+";
+      }
+      if (unconfirmed.length) {
+        msg += "PENDING (need to confirm):
+" + unconfirmed.map((m) => "  " + m.attributes.team_position_name + ": " + m.attributes.name).join("
+") + "
+
+";
+      }
+      if (declined.length) {
+        msg += "DECLINED (need coverage):
+" + declined.map((m) => "  " + m.attributes.team_position_name + ": " + m.attributes.name).join("
+") + "
+
+";
+      }
+    }
+
+    const channel = overrideChannel || SLACK_USER_ID;
+    await sendSlackMessage(channel, msg.trim());
+    console.log("Wednesday summary sent successfully");
+  } catch (e) {
+    console.error("Wednesday summary error:", e.message);
+  }
+}
+
+// ─── Schedule: Thursday 8am Central (14:00 UTC) & Tuesday 8am Central (14:00 UTC) ───
 function startScheduler() {
-  console.log("Scheduler started — weekly summary runs every Thursday at 8am Central");
+  console.log("Scheduler started — Sunday summary Thursdays, Wednesday summary Tuesdays, both at 8am Central");
   setInterval(async () => {
     const now = new Date();
     const utcHour = now.getUTCHours();
     const utcMinute = now.getUTCMinutes();
-    const utcDay = now.getUTCDay();
+    const utcDay = now.getUTCDay(); // 0=Sun, 1=Mon, 2=Tue, 3=Wed, 4=Thu
+
+    // Thursday at 14:00 UTC = 8am Central — Sunday summary
     if (utcDay === 4 && utcHour === 14 && utcMinute < 1) {
       await sendWeeklySummary();
+    }
+
+    // Tuesday at 14:00 UTC = 8am Central — Wednesday summary
+    if (utcDay === 2 && utcHour === 14 && utcMinute < 1) {
+      await sendWednesdaySummary();
     }
   }, 60 * 1000);
 }
@@ -561,6 +658,12 @@ async function handleMessage(userId, channelId, text) {
   if (["summary", "weekly summary", "sunday summary"].includes(text.toLowerCase())) {
     await sendSlackMessage(channelId, "Pulling your Sunday Production summary...");
     await sendWeeklySummary(channelId);
+    return;
+  }
+
+  if (["wednesday summary", "midweek summary", "wed summary"].includes(text.toLowerCase())) {
+    await sendSlackMessage(channelId, "Pulling your Wednesday Production summary...");
+    await sendWednesdaySummary(channelId);
     return;
   }
 
