@@ -3,10 +3,10 @@ const crypto = require("crypto");
 const app = express();
 
 // ─── Environment variables ────────────────────────────────────────────────────
-const ANTHROPIC_KEY      = process.env.ANTHROPIC_API_KEY;
-const PC_APP_ID          = process.env.PC_APP_ID;
-const PC_SECRET          = process.env.PC_SECRET;
-const SLACK_BOT_TOKEN    = process.env.SLACK_BOT_TOKEN;
+const ANTHROPIC_KEY        = process.env.ANTHROPIC_API_KEY;
+const PC_APP_ID            = process.env.PC_APP_ID;
+const PC_SECRET            = process.env.PC_SECRET;
+const SLACK_BOT_TOKEN      = process.env.SLACK_BOT_TOKEN;
 const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
 
 // ─── In-memory state ─────────────────────────────────────────────────────────
@@ -23,10 +23,7 @@ function verifySlackSignature(req) {
   const timestamp = req.headers["x-slack-request-timestamp"];
   const signature = req.headers["x-slack-signature"];
   if (!timestamp || !signature) return false;
-
-  // Prevent replay attacks
   if (Math.abs(Date.now() / 1000 - timestamp) > 300) return false;
-
   const sigBase = `v0:${timestamp}:${req.rawBody}`;
   const hmac = crypto.createHmac("sha256", SLACK_SIGNING_SECRET);
   hmac.update(sigBase);
@@ -117,7 +114,6 @@ async function handleMessage(userId, channelId, text) {
 
   console.log(`Message from ${userId}: ${text}`);
 
-  // Reset command
   if (["reset", "clear"].includes(text.toLowerCase())) {
     conversations[userId] = [];
     pcCache = { context: null, fetchedAt: 0 };
@@ -125,7 +121,6 @@ async function handleMessage(userId, channelId, text) {
     return;
   }
 
-  // Refresh command
   if (text.toLowerCase() === "refresh") {
     pcCache = { context: null, fetchedAt: 0 };
     await sendSlackMessage(channelId, "Planning Center data will refresh on your next message.");
@@ -136,66 +131,61 @@ async function handleMessage(userId, channelId, text) {
   conversations[userId].push({ role: "user", content: text });
   if (conversations[userId].length > 10) conversations[userId] = conversations[userId].slice(-10);
 
-  try {
-    const pcContext = await getPlanningCenterContext();
+  console.log("Fetching Planning Center context...");
+  const pcContext = await getPlanningCenterContext();
+  console.log("PC context fetched, calling Claude...");
 
-    const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": ANTHROPIC_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 800,
-        system: `You are a Production Team AI assistant for a church, accessed via Slack. Help the production director manage their volunteer team.
+  const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": ANTHROPIC_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 800,
+      system: `You are a Production Team AI assistant for a church, accessed via Slack. Help the production director manage their volunteer team.
 
 Live Planning Center data (refreshed every 5 minutes):
 ${pcContext}
 
 Keep responses concise and practical. No markdown formatting — plain text only. For drafted messages or detailed lists, longer responses are fine.
-Commands the user can send: reset (clear history), refresh (force Planning Center data update).`,
-        messages: conversations[userId].map((m) => ({ role: m.role, content: m.content })),
-      }),
-    });
+Commands: reset (clear history), refresh (force Planning Center data update).`,
+      messages: conversations[userId].map((m) => ({ role: m.role, content: m.content })),
+    }),
+  });
 
-    const data = await aiRes.json();
-    const reply =
-      data.content?.filter((c) => c.type === "text").map((c) => c.text).join("") ||
-      "Sorry, I couldn't respond. Try again.";
+  console.log("Claude response status:", aiRes.status);
+  const data = await aiRes.json();
+  console.log("Claude response data:", JSON.stringify(data).slice(0, 300));
 
-    conversations[userId].push({ role: "assistant", content: reply });
-    await sendSlackMessage(channelId, reply);
-    console.log(`Replied to ${userId}`);
-  } catch (e) {
-    console.error("Full error:", JSON.stringify(e, null, 2), e.message, e.stack);
-    await sendSlackMessage(channelId, `Error: ${e.message}`);
-  }
+  const reply =
+    data.content?.filter((c) => c.type === "text").map((c) => c.text).join("") ||
+    `No reply generated. Raw: ${JSON.stringify(data).slice(0, 200)}`;
+
+  conversations[userId].push({ role: "assistant", content: reply });
+  await sendSlackMessage(channelId, reply);
+  console.log(`Replied to ${userId}`);
 }
 
 // ─── Slack Events endpoint ────────────────────────────────────────────────────
 app.post("/slack/events", async (req, res) => {
-  // Verify signature
   if (!verifySlackSignature(req)) {
+    console.log("Signature verification failed");
     return res.status(401).send("Unauthorized");
   }
 
   const { type, challenge, event } = req.body;
 
-  // URL verification challenge
   if (type === "url_verification") {
     return res.json({ challenge });
   }
 
-  // Acknowledge immediately
   res.sendStatus(200);
 
-  // Handle direct messages and app mentions
   if (type === "event_callback") {
-    // Ignore bot messages to prevent loops
     if (event.bot_id || event.subtype === "bot_message") return;
-
     if (event.type === "message" || event.type === "app_mention") {
       const text = (event.text || "").replace(/<@[^>]+>/g, "").trim();
       await handleMessage(event.user, event.channel, text);
@@ -209,5 +199,5 @@ app.get("/", (req, res) => res.send("Production Hub Slack server is running ✓"
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
 
-process.on("uncaughtException", (e) => console.error("Uncaught exception:", e.message));
+process.on("uncaughtException", (e) => console.error("Uncaught exception:", e.message, e.stack));
 process.on("unhandledRejection", (e) => console.error("Unhandled rejection:", e));
