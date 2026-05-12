@@ -1,23 +1,38 @@
 const express = require("express");
+const crypto = require("crypto");
 const app = express();
-app.use(express.json());
 
 // ─── Environment variables ────────────────────────────────────────────────────
-const ANTHROPIC_KEY  = process.env.ANTHROPIC_API_KEY;
-const PC_APP_ID      = process.env.PC_APP_ID;
-const PC_SECRET      = process.env.PC_SECRET;
-const MY_PHONE       = process.env.MY_PHONE_NUMBER;
-const SIGNAL_NUMBER  = process.env.SIGNAL_NUMBER;
-const SIGNAL_API     = process.env.SIGNAL_API || "http://signal-cli-rest-api.railway.internal:8080";
-const POLL_INTERVAL  = 3000;
+const ANTHROPIC_KEY      = process.env.ANTHROPIC_API_KEY;
+const PC_APP_ID          = process.env.PC_APP_ID;
+const PC_SECRET          = process.env.PC_SECRET;
+const SLACK_BOT_TOKEN    = process.env.SLACK_BOT_TOKEN;
+const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
 
 // ─── In-memory state ─────────────────────────────────────────────────────────
 const conversations = {};
-let lastTimestamp = Date.now();
-let isPolling = false;
-
-// ─── Planning Center cache (5 min TTL) ──────────────────────────────────────
 let pcCache = { context: null, fetchedAt: 0 };
+
+// ─── Raw body parser for Slack signature verification ────────────────────────
+app.use(express.json({
+  verify: (req, res, buf) => { req.rawBody = buf; }
+}));
+
+// ─── Slack signature verification ────────────────────────────────────────────
+function verifySlackSignature(req) {
+  const timestamp = req.headers["x-slack-request-timestamp"];
+  const signature = req.headers["x-slack-signature"];
+  if (!timestamp || !signature) return false;
+
+  // Prevent replay attacks
+  if (Math.abs(Date.now() / 1000 - timestamp) > 300) return false;
+
+  const sigBase = `v0:${timestamp}:${req.rawBody}`;
+  const hmac = crypto.createHmac("sha256", SLACK_SIGNING_SECRET);
+  hmac.update(sigBase);
+  const computed = `v0=${hmac.digest("hex")}`;
+  return crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(signature));
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 function fmtDate(s) {
@@ -84,48 +99,42 @@ async function getPlanningCenterContext() {
   }
 }
 
-async function sendSignalMessage(recipient, message) {
-  try {
-    const r = await fetch(`${SIGNAL_API}/v2/send`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        message,
-        number: SIGNAL_NUMBER,
-        recipients: [recipient],
-      }),
-    });
-    if (!r.ok) {
-      const text = await r.text();
-      console.error(`Signal send failed: ${r.status} ${text}`);
-    }
-  } catch (e) {
-    console.error("Send error:", e.message);
-  }
+async function sendSlackMessage(channel, text) {
+  const r = await fetch("https://slack.com/api/chat.postMessage", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+    },
+    body: JSON.stringify({ channel, text }),
+  });
+  const data = await r.json();
+  if (!data.ok) console.error("Slack send error:", data.error);
 }
 
-async function handleMessage(from, body) {
-  if (!body) return;
-  if (MY_PHONE && from !== MY_PHONE) return;
+async function handleMessage(userId, channelId, text) {
+  if (!text) return;
 
-  console.log(`Message from ${from}: ${body}`);
+  console.log(`Message from ${userId}: ${text}`);
 
-  if (["reset", "clear"].includes(body.toLowerCase())) {
-    conversations[from] = [];
+  // Reset command
+  if (["reset", "clear"].includes(text.toLowerCase())) {
+    conversations[userId] = [];
     pcCache = { context: null, fetchedAt: 0 };
-    await sendSignalMessage(from, "Cleared! Fresh start. What do you need?");
+    await sendSlackMessage(channelId, "Cleared! Fresh start. What do you need?");
     return;
   }
 
-  if (body.toLowerCase() === "refresh") {
+  // Refresh command
+  if (text.toLowerCase() === "refresh") {
     pcCache = { context: null, fetchedAt: 0 };
-    await sendSignalMessage(from, "Planning Center data will refresh on your next message.");
+    await sendSlackMessage(channelId, "Planning Center data will refresh on your next message.");
     return;
   }
 
-  if (!conversations[from]) conversations[from] = [];
-  conversations[from].push({ role: "user", content: body });
-  if (conversations[from].length > 10) conversations[from] = conversations[from].slice(-10);
+  if (!conversations[userId]) conversations[userId] = [];
+  conversations[userId].push({ role: "user", content: text });
+  if (conversations[userId].length > 10) conversations[userId] = conversations[userId].slice(-10);
 
   try {
     const pcContext = await getPlanningCenterContext();
@@ -140,14 +149,14 @@ async function handleMessage(from, body) {
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
         max_tokens: 800,
-        system: `You are a Production Team AI assistant for a church, accessed via Signal messenger. Help the production director manage their volunteer team.
+        system: `You are a Production Team AI assistant for a church, accessed via Slack. Help the production director manage their volunteer team.
 
 Live Planning Center data (refreshed every 5 minutes):
 ${pcContext}
 
-Keep responses concise and practical. No markdown formatting — plain text only since this is a messaging app. For drafted messages or detailed lists, longer responses are fine.
-Commands the user can send: RESET (clear history), REFRESH (force Planning Center data update).`,
-        messages: conversations[from].map((m) => ({ role: m.role, content: m.content })),
+Keep responses concise and practical. No markdown formatting — plain text only. For drafted messages or detailed lists, longer responses are fine.
+Commands the user can send: reset (clear history), refresh (force Planning Center data update).`,
+        messages: conversations[userId].map((m) => ({ role: m.role, content: m.content })),
       }),
     });
 
@@ -156,78 +165,49 @@ Commands the user can send: RESET (clear history), REFRESH (force Planning Cente
       data.content?.filter((c) => c.type === "text").map((c) => c.text).join("") ||
       "Sorry, I couldn't respond. Try again.";
 
-    conversations[from].push({ role: "assistant", content: reply });
-    await sendSignalMessage(from, reply);
-    console.log(`Replied to ${from}`);
+    conversations[userId].push({ role: "assistant", content: reply });
+    await sendSlackMessage(channelId, reply);
+    console.log(`Replied to ${userId}`);
   } catch (e) {
-    console.error("AI error:", e.message);
-    await sendSignalMessage(from, "Something went wrong. Please try again.");
+    console.error("Error:", e.message);
+    await sendSlackMessage(channelId, "Something went wrong. Please try again.");
   }
 }
 
-// ─── Polling loop ─────────────────────────────────────────────────────────────
-async function pollMessages() {
-  if (isPolling) return; // prevent overlapping polls
-  isPolling = true;
-  try {
-    const url = `${SIGNAL_API}/v1/receive/${encodeURIComponent(SIGNAL_NUMBER)}`;
-    const r = await fetch(url, { signal: AbortSignal.timeout(30000) });
+// ─── Slack Events endpoint ────────────────────────────────────────────────────
+app.post("/slack/events", async (req, res) => {
+  // Verify signature
+  if (!verifySlackSignature(req)) {
+    return res.status(401).send("Unauthorized");
+  }
 
-    if (r.status === 200) {
-      const text = await r.text();
-      if (!text || text === "null") return;
-      
-      let messages;
-      try {
-        messages = JSON.parse(text);
-      } catch {
-        return;
-      }
+  const { type, challenge, event } = req.body;
 
-      if (!Array.isArray(messages) || messages.length === 0) return;
+  // URL verification challenge
+  if (type === "url_verification") {
+    return res.json({ challenge });
+  }
 
-      for (const msg of messages) {
-        try {
-          const envelope = msg?.envelope;
-          if (!envelope) continue;
+  // Acknowledge immediately
+  res.sendStatus(200);
 
-          const dataMessage = envelope?.dataMessage;
-          if (!dataMessage) continue;
+  // Handle direct messages and app mentions
+  if (type === "event_callback") {
+    // Ignore bot messages to prevent loops
+    if (event.bot_id || event.subtype === "bot_message") return;
 
-          const msgTimestamp = envelope.timestamp || 0;
-          if (msgTimestamp && msgTimestamp <= lastTimestamp) continue;
-          if (msgTimestamp) lastTimestamp = msgTimestamp;
-
-          const from = envelope.source;
-          const body = (dataMessage.message || "").trim();
-
-          await handleMessage(from, body);
-        } catch (e) {
-          console.error("Error processing individual message:", e.message);
-        }
-      }
+    if (event.type === "message" || event.type === "app_mention") {
+      const text = (event.text || "").replace(/<@[^>]+>/g, "").trim();
+      await handleMessage(event.user, event.channel, text);
     }
-  } catch (e) {
-    console.error("Poll error:", e.message);
-  } finally {
-    isPolling = false;
   }
-}
-
-// Start polling
-setTimeout(() => {
-  console.log("Starting message polling...");
-  setInterval(pollMessages, POLL_INTERVAL);
-}, 3000);
-
-// ─── Health check ────────────────────────────────────────────────────────────
-app.get("/", (req, res) => res.send("Production Hub Signal server is running ✓"));
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
 });
 
-// Keep process alive and handle errors gracefully
+// ─── Health check ─────────────────────────────────────────────────────────────
+app.get("/", (req, res) => res.send("Production Hub Slack server is running ✓"));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+
 process.on("uncaughtException", (e) => console.error("Uncaught exception:", e.message));
 process.on("unhandledRejection", (e) => console.error("Unhandled rejection:", e));

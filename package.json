@@ -1,5 +1,5 @@
 {
-  "name": "production-hub-sms",
+  "name": "production-hub",
   "version": "1.0.0",
   "main": "server.js",
   "scripts": {
