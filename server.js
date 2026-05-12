@@ -389,7 +389,7 @@ async function sendWeeklySummary(overrideChannel) {
     const unconfirmed = team.filter((m) => m.attributes.status === "U");
     const declined    = team.filter((m) => m.attributes.status === "D");
 
-    let msg = "Good morning! Here is your Production Team summary for this Sunday.\n\n";
+    let msg = "Good morning! Here is your Production Team summary for this Sunday." + "\n\n";
     msg += "Service: " + (p.title || "Worship Experience") + "\n";
     msg += "Date: " + fmtDateLong(p.sort_date) + "\n\n";
     msg += confirmed.length + " confirmed, " + unconfirmed.length + " pending, " + declined.length + " declined\n\n";
@@ -440,9 +440,7 @@ async function sendWednesdaySummary(overrideChannel) {
       return;
     }
 
-    let msg = "Good morning! Here is your Production Team summary for this Wednesday.
-
-";
+    let msg = "Good morning! Here is your Production Team summary for this Wednesday.\n\n";
 
     for (const st of wedServiceTypes) {
       const plansData = await pcFetch(
@@ -450,9 +448,7 @@ async function sendWednesdaySummary(overrideChannel) {
       );
       const plans = plansData.data || [];
       if (!plans.length) {
-        msg += st.attributes.name + ": No upcoming plans found.
-
-";
+        msg += st.attributes.name + ": No upcoming plans found.\n\n";
         continue;
       }
 
@@ -471,34 +467,18 @@ async function sendWednesdaySummary(overrideChannel) {
       const unconfirmed = team.filter((m) => m.attributes.status === "U");
       const declined    = team.filter((m) => m.attributes.status === "D");
 
-      msg += st.attributes.name + " — " + (p.title || "Service") + "
-";
-      msg += "Date: " + fmtDateLong(p.sort_date) + "
-";
-      msg += confirmed.length + " confirmed, " + unconfirmed.length + " pending, " + declined.length + " declined
-
-";
+      msg += st.attributes.name + " — " + (p.title || "Service") + "\n";
+      msg += "Date: " + fmtDateLong(p.sort_date) + "\n";
+      msg += confirmed.length + " confirmed, " + unconfirmed.length + " pending, " + declined.length + " declined\n\n";
 
       if (confirmed.length) {
-        msg += "CONFIRMED:
-" + confirmed.map((m) => "  " + m.attributes.team_position_name + ": " + m.attributes.name).join("
-") + "
-
-";
+        msg += "CONFIRMED:\n" + confirmed.map((m) => "  " + m.attributes.team_position_name + ": " + m.attributes.name).join("\n") + "\n\n";
       }
       if (unconfirmed.length) {
-        msg += "PENDING (need to confirm):
-" + unconfirmed.map((m) => "  " + m.attributes.team_position_name + ": " + m.attributes.name).join("
-") + "
-
-";
+        msg += "PENDING (need to confirm):\n" + unconfirmed.map((m) => "  " + m.attributes.team_position_name + ": " + m.attributes.name).join("\n") + "\n\n";
       }
       if (declined.length) {
-        msg += "DECLINED (need coverage):
-" + declined.map((m) => "  " + m.attributes.team_position_name + ": " + m.attributes.name).join("
-") + "
-
-";
+        msg += "DECLINED (need coverage):\n" + declined.map((m) => "  " + m.attributes.team_position_name + ": " + m.attributes.name).join("\n") + "\n\n";
       }
     }
 
