@@ -169,8 +169,8 @@ Commands the user can send: reset (clear history), refresh (force Planning Cente
     await sendSlackMessage(channelId, reply);
     console.log(`Replied to ${userId}`);
   } catch (e) {
-    console.error("Error:", e.message);
-    await sendSlackMessage(channelId, "Something went wrong. Please try again.");
+    console.error("Full error:", JSON.stringify(e, null, 2), e.message, e.stack);
+    await sendSlackMessage(channelId, `Error: ${e.message}`);
   }
 }
 
