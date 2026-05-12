@@ -8,6 +8,7 @@ const PC_APP_ID            = process.env.PC_APP_ID;
 const PC_SECRET            = process.env.PC_SECRET;
 const SLACK_BOT_TOKEN      = process.env.SLACK_BOT_TOKEN;
 const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
+const SLACK_USER_ID        = process.env.SLACK_USER_ID;
 
 // ─── Target service types & teams ────────────────────────────────────────────
 const TARGET_SERVICE_TYPES = ["Worship Experience", "Midweek Experience", "Bridge Youth"];
@@ -51,6 +52,13 @@ function fmtDate(s) {
   });
 }
 
+function fmtDateLong(s) {
+  if (!s) return "TBD";
+  return new Date(s).toLocaleDateString("en-US", {
+    weekday: "long", month: "long", day: "numeric", year: "numeric",
+  });
+}
+
 function fmtTime(s) {
   if (!s) return "";
   return new Date(s).toLocaleTimeString("en-US", {
@@ -67,42 +75,39 @@ async function getTargetServiceTypes() {
 
 // ─── Get only Production team members for a plan ─────────────────────────────
 async function getProductionMembers(serviceTypeId, planId) {
-  // Fetch team members with team relationship included
   const data = await pcFetch(
     `/services/v2/service_types/${serviceTypeId}/plans/${planId}/team_members?include=team&per_page=100`
   );
   const members = data.data || [];
   const included = data.included || [];
 
-  // Log team names for debugging
   const teamNames = [...new Set(included.filter(i => i.type === "Team").map(i => i.attributes.name))];
   console.log("Teams included:", JSON.stringify(teamNames));
 
-  // Find the Production team ID from included
   const prodTeam = included.find((i) =>
     i.type === "Team" && i.attributes.name.toLowerCase().includes(PRODUCTION_TEAM_NAME.toLowerCase())
   );
 
   if (!prodTeam) {
-    console.log("No Production team found in included, returning all members");
+    console.log("No Production team found, returning all members");
     return members;
   }
 
   console.log("Found Production team:", prodTeam.attributes.name, "ID:", prodTeam.id);
 
-  // Filter members to only those on the Production team
   return members.filter((m) => {
-    const teamRel = m.relationships?.team?.data;
+    const teamRel = m.relationships && m.relationships.team && m.relationships.team.data;
     return teamRel && teamRel.id === prodTeam.id;
   });
 }
 
 // ─── Planning Center Tools ────────────────────────────────────────────────────
 
-async function getScheduleSummary(productionOnly = false) {
+async function getScheduleSummary(productionOnly) {
+  if (productionOnly === undefined) productionOnly = true;
   try {
     const sts = await getTargetServiceTypes();
-    if (!sts.length) return "Could not find Worship Experience, Midweek Experience, or Bridge Youth in Planning Center.";
+    if (!sts.length) return "Could not find target service types in Planning Center.";
 
     let ctx = "";
 
@@ -113,7 +118,7 @@ async function getScheduleSummary(productionOnly = false) {
       const plans = plansData.data || [];
 
       if (!plans.length) {
-        ctx += `\n[${st.attributes.name}] No upcoming plans.\n`;
+        ctx += "\n[" + st.attributes.name + "] No upcoming plans.\n";
         continue;
       }
 
@@ -133,22 +138,29 @@ async function getScheduleSummary(productionOnly = false) {
         const unconfirmed = team.filter((m) => m.attributes.status === "U");
         const declined    = team.filter((m) => m.attributes.status === "D");
 
-        ctx += `\n[${st.attributes.name}] "${p.title || "Service"}" on ${fmtDate(p.sort_date)}\n`;
-        ctx += `  ${confirmed.length} confirmed, ${unconfirmed.length} pending, ${declined.length} declined\n`;
+        ctx += "\n[" + st.attributes.name + "] \"" + (p.title || "Service") + "\" on " + fmtDate(p.sort_date) + "\n";
+        ctx += "  " + confirmed.length + " confirmed, " + unconfirmed.length + " pending, " + declined.length + " declined\n";
 
-        if (confirmed.length) ctx += `  Confirmed: ${confirmed.map((m) => `${m.attributes.name} (${m.attributes.team_position_name})`).join(", ")}\n`;
-        if (unconfirmed.length) ctx += `  Pending: ${unconfirmed.map((m) => `${m.attributes.name} (${m.attributes.team_position_name})`).join(", ")}\n`;
-        if (declined.length) ctx += `  Declined: ${declined.map((m) => `${m.attributes.name} (${m.attributes.team_position_name})`).join(", ")}\n`;
+        if (confirmed.length) {
+          ctx += "  Confirmed: " + confirmed.map((m) => m.attributes.name + " (" + m.attributes.team_position_name + ")").join(", ") + "\n";
+        }
+        if (unconfirmed.length) {
+          ctx += "  Pending: " + unconfirmed.map((m) => m.attributes.name + " (" + m.attributes.team_position_name + ")").join(", ") + "\n";
+        }
+        if (declined.length) {
+          ctx += "  Declined: " + declined.map((m) => m.attributes.name + " (" + m.attributes.team_position_name + ")").join(", ") + "\n";
+        }
       }
     }
 
     return ctx || "No upcoming plans found.";
   } catch (e) {
-    return `Error fetching schedule: ${e.message}`;
+    return "Error fetching schedule: " + e.message;
   }
 }
 
-async function getPlanTeam(serviceTypeName, dateHint, productionOnly = true) {
+async function getPlanTeam(serviceTypeName, dateHint, productionOnly) {
+  if (productionOnly === undefined) productionOnly = true;
   try {
     const sts = await getTargetServiceTypes();
     const st = sts.find((s) =>
@@ -161,15 +173,14 @@ async function getPlanTeam(serviceTypeName, dateHint, productionOnly = true) {
       `/services/v2/service_types/${st.id}/plans?filter=future&order=sort_date&per_page=10`
     );
     const plans = plansData.data || [];
-    if (!plans.length) return `No upcoming plans found for ${st.attributes.name}.`;
+    if (!plans.length) return "No upcoming plans found for " + st.attributes.name + ".";
 
     let targetPlan = plans[0];
     if (dateHint) {
       const hintDate = new Date(dateHint);
       let closest = Infinity;
       for (const plan of plans) {
-        const planDate = new Date(plan.attributes.sort_date);
-        const diff = Math.abs(planDate - hintDate);
+        const diff = Math.abs(new Date(plan.attributes.sort_date) - hintDate);
         if (diff < closest) {
           closest = diff;
           targetPlan = plan;
@@ -190,30 +201,30 @@ async function getPlanTeam(serviceTypeName, dateHint, productionOnly = true) {
 
     if (!team.length) {
       return productionOnly
-        ? `No Production team members scheduled for ${st.attributes.name} on ${fmtDate(p.sort_date)}. The team may not be scheduled yet.`
-        : `No team members scheduled for ${st.attributes.name} on ${fmtDate(p.sort_date)}.`;
+        ? "No Production team members scheduled for " + st.attributes.name + " on " + fmtDate(p.sort_date) + ". The team may not be scheduled yet."
+        : "No team members scheduled for " + st.attributes.name + " on " + fmtDate(p.sort_date) + ".";
     }
 
     const confirmed   = team.filter((m) => m.attributes.status === "C");
     const unconfirmed = team.filter((m) => m.attributes.status === "U");
     const declined    = team.filter((m) => m.attributes.status === "D");
 
-    let result = `${st.attributes.name} — ${p.title || "Service"} on ${fmtDate(p.sort_date)}\n`;
-    result += `Production Team: ${confirmed.length} confirmed, ${unconfirmed.length} pending, ${declined.length} declined\n\n`;
+    let result = st.attributes.name + " — " + (p.title || "Service") + " on " + fmtDate(p.sort_date) + "\n";
+    result += "Production Team: " + confirmed.length + " confirmed, " + unconfirmed.length + " pending, " + declined.length + " declined\n\n";
 
     if (confirmed.length) {
-      result += `CONFIRMED:\n${confirmed.map((m) => `  ${m.attributes.team_position_name}: ${m.attributes.name}`).join("\n")}\n\n`;
+      result += "CONFIRMED:\n" + confirmed.map((m) => "  " + m.attributes.team_position_name + ": " + m.attributes.name).join("\n") + "\n\n";
     }
     if (unconfirmed.length) {
-      result += `PENDING:\n${unconfirmed.map((m) => `  ${m.attributes.team_position_name}: ${m.attributes.name}`).join("\n")}\n\n`;
+      result += "PENDING:\n" + unconfirmed.map((m) => "  " + m.attributes.team_position_name + ": " + m.attributes.name).join("\n") + "\n\n";
     }
     if (declined.length) {
-      result += `DECLINED:\n${declined.map((m) => `  ${m.attributes.team_position_name}: ${m.attributes.name}`).join("\n")}\n`;
+      result += "DECLINED:\n" + declined.map((m) => "  " + m.attributes.team_position_name + ": " + m.attributes.name).join("\n") + "\n";
     }
 
     return result;
   } catch (e) {
-    return `Error fetching team: ${e.message}`;
+    return "Error fetching team: " + e.message;
   }
 }
 
@@ -223,27 +234,27 @@ async function searchPeople(name) {
       `/people/v2/people?where[search_name]=${encodeURIComponent(name)}&include=emails,phone_numbers&per_page=5`
     );
     const people = data.data || [];
-    if (!people.length) return `No one found matching "${name}".`;
+    if (!people.length) return "No one found matching \"" + name + "\".";
 
     const included = data.included || [];
 
     return people.map((p) => {
       const attr = p.attributes;
       const phones = included
-        .filter((i) => i.type === "PhoneNumber" && p.relationships?.phone_numbers?.data?.some((ph) => ph.id === i.id))
-        .map((i) => `${i.attributes.number} (${i.attributes.location || "phone"})`);
+        .filter((i) => i.type === "PhoneNumber" && p.relationships && p.relationships.phone_numbers && p.relationships.phone_numbers.data && p.relationships.phone_numbers.data.some((ph) => ph.id === i.id))
+        .map((i) => i.attributes.number + " (" + (i.attributes.location || "phone") + ")");
       const emails = included
-        .filter((i) => i.type === "Email" && p.relationships?.emails?.data?.some((e) => e.id === i.id))
-        .map((i) => `${i.attributes.address} (${i.attributes.location || "email"})`);
+        .filter((i) => i.type === "Email" && p.relationships && p.relationships.emails && p.relationships.emails.data && p.relationships.emails.data.some((e) => e.id === i.id))
+        .map((i) => i.attributes.address + " (" + (i.attributes.location || "email") + ")");
 
       return [
-        `Name: ${attr.first_name} ${attr.last_name}`,
-        phones.length ? `Phone: ${phones.join(", ")}` : "Phone: not on file",
-        emails.length ? `Email: ${emails.join(", ")}` : "Email: not on file",
+        "Name: " + attr.first_name + " " + attr.last_name,
+        phones.length ? "Phone: " + phones.join(", ") : "Phone: not on file",
+        emails.length ? "Email: " + emails.join(", ") : "Email: not on file",
       ].join("\n");
     }).join("\n\n");
   } catch (e) {
-    return `Error searching people: ${e.message}`;
+    return "Error searching people: " + e.message;
   }
 }
 
@@ -252,7 +263,7 @@ async function getBlockouts(startDate, endDate) {
     const start = startDate || new Date().toISOString().split("T")[0];
     const end = endDate || new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
 
-    const data = await pcFetch(`/services/v2/blockouts?filter=future&per_page=50`);
+    const data = await pcFetch("/services/v2/blockouts?filter=future&per_page=50");
     const blockouts = data.data || [];
     const included = data.included || [];
 
@@ -262,32 +273,32 @@ async function getBlockouts(startDate, endDate) {
       return bStart <= new Date(end) && bEnd >= new Date(start);
     });
 
-    if (!filtered.length) return `No blockouts found between ${start} and ${end}.`;
+    if (!filtered.length) return "No blockouts found between " + start + " and " + end + ".";
 
     return filtered.map((b) => {
       const attr = b.attributes;
-      const personId = b.relationships?.person?.data?.id;
+      const personId = b.relationships && b.relationships.person && b.relationships.person.data && b.relationships.person.data.id;
       const person = included.find((i) => i.id === personId);
-      const personName = person ? `${person.attributes.first_name} ${person.attributes.last_name}` : "Unknown";
-      return `${personName}: ${fmtDate(attr.starts_at)} to ${fmtDate(attr.ends_at)}${attr.reason ? ` — ${attr.reason}` : ""}`;
+      const personName = person ? person.attributes.first_name + " " + person.attributes.last_name : "Unknown";
+      return personName + ": " + fmtDate(attr.starts_at) + " to " + fmtDate(attr.ends_at) + (attr.reason ? " — " + attr.reason : "");
     }).join("\n");
   } catch (e) {
-    return `Error fetching blockouts: ${e.message}`;
+    return "Error fetching blockouts: " + e.message;
   }
 }
 
 async function getServiceTimes() {
   try {
     const sts = await getTargetServiceTypes();
-    let results = [];
+    const results = [];
 
     for (const st of sts) {
       const plansData = await pcFetch(
-        `/services/v2/service_types/${st.id}/plans?filter=future&order=sort_date&per_page=2`
+        `/services/v2/service_types/${st.id}/plans?filter=future&order=sort_date&per_page=1`
       );
       const plans = plansData.data || [];
 
-      for (const plan of plans.slice(0, 1)) {
+      for (const plan of plans) {
         const p = plan.attributes;
         const timesData = await pcFetch(
           `/services/v2/service_types/${st.id}/plans/${plan.id}/plan_times`
@@ -295,17 +306,17 @@ async function getServiceTimes() {
         const times = timesData.data || [];
         const timeStrs = times.map((t) => {
           const ta = t.attributes;
-          return `  ${ta.name || "Service"}: ${fmtTime(ta.starts_at)} - ${fmtTime(ta.ends_at)}`;
+          return "  " + (ta.name || "Service") + ": " + fmtTime(ta.starts_at) + " - " + fmtTime(ta.ends_at);
         });
         results.push(
-          `[${st.attributes.name}] ${p.title || "Service"} on ${fmtDate(p.sort_date)}:\n${timeStrs.join("\n") || "  No times set"}`
+          "[" + st.attributes.name + "] " + (p.title || "Service") + " on " + fmtDate(p.sort_date) + ":\n" + (timeStrs.join("\n") || "  No times set")
         );
       }
     }
 
     return results.join("\n\n") || "No upcoming service times found.";
   } catch (e) {
-    return `Error fetching service times: ${e.message}`;
+    return "Error fetching service times: " + e.message;
   }
 }
 
@@ -315,33 +326,119 @@ async function getPersonSchedule(name) {
       `/people/v2/people?where[search_name]=${encodeURIComponent(name)}&per_page=3`
     );
     const people = peopleData.data || [];
-    if (!people.length) return `No one found matching "${name}".`;
+    if (!people.length) return "No one found matching \"" + name + "\".";
 
     const person = people[0];
-    const personName = `${person.attributes.first_name} ${person.attributes.last_name}`;
+    const personName = person.attributes.first_name + " " + person.attributes.last_name;
 
     const scheduleData = await pcFetch(
       `/services/v2/people/${person.id}/schedules?filter=future&per_page=10`
     );
     const schedules = scheduleData.data || [];
-    if (!schedules.length) return `${personName} has no upcoming scheduled services.`;
+    if (!schedules.length) return personName + " has no upcoming scheduled services.";
 
     const list = schedules.map((s) => {
       const a = s.attributes;
-      return `${fmtDate(a.sort_date)}: ${a.service_type_name || "Service"} — ${a.team_position_name || "Team"} (${a.status || "unknown"})`;
+      return fmtDate(a.sort_date) + ": " + (a.service_type_name || "Service") + " — " + (a.team_position_name || "Team") + " (" + (a.status || "unknown") + ")";
     }).join("\n");
 
-    return `${personName}'s upcoming schedule:\n${list}`;
+    return personName + "'s upcoming schedule:\n" + list;
   } catch (e) {
-    return `Error fetching schedule for ${name}: ${e.message}`;
+    return "Error fetching schedule for " + name + ": " + e.message;
   }
+}
+
+// ─── Scheduled Sunday summary ─────────────────────────────────────────────────
+async function sendWeeklySummary(overrideChannel) {
+  console.log("Running weekly Production summary...");
+  try {
+    const today = new Date();
+    const daysUntilSunday = (7 - today.getDay()) % 7 || 7;
+    const nextSunday = new Date(today);
+    nextSunday.setDate(today.getDate() + daysUntilSunday);
+    const sundayDate = nextSunday.toISOString().split("T")[0];
+
+    const sts = await getTargetServiceTypes();
+    const worshipST = sts.find((s) => s.attributes.name === "Worship Experience");
+    if (!worshipST) {
+      console.log("Weekly summary: Worship Experience not found");
+      return;
+    }
+
+    const plansData = await pcFetch(
+      `/services/v2/service_types/${worshipST.id}/plans?filter=future&order=sort_date&per_page=5`
+    );
+    const plans = plansData.data || [];
+    if (!plans.length) {
+      console.log("Weekly summary: No upcoming plans");
+      return;
+    }
+
+    const hintDate = new Date(sundayDate);
+    let targetPlan = plans[0];
+    let closest = Infinity;
+    for (const plan of plans) {
+      const diff = Math.abs(new Date(plan.attributes.sort_date) - hintDate);
+      if (diff < closest) { closest = diff; targetPlan = plan; }
+    }
+
+    const p = targetPlan.attributes;
+    const team = await getProductionMembers(worshipST.id, targetPlan.id);
+
+    const confirmed   = team.filter((m) => m.attributes.status === "C");
+    const unconfirmed = team.filter((m) => m.attributes.status === "U");
+    const declined    = team.filter((m) => m.attributes.status === "D");
+
+    let msg = "Good morning! Here is your Production Team summary for this Sunday.\n\n";
+    msg += "Service: " + (p.title || "Worship Experience") + "\n";
+    msg += "Date: " + fmtDateLong(p.sort_date) + "\n\n";
+    msg += confirmed.length + " confirmed, " + unconfirmed.length + " pending, " + declined.length + " declined\n\n";
+
+    if (confirmed.length) {
+      msg += "CONFIRMED:\n" + confirmed.map((m) => "  " + m.attributes.team_position_name + ": " + m.attributes.name).join("\n") + "\n\n";
+    }
+    if (unconfirmed.length) {
+      msg += "PENDING (need to confirm):\n" + unconfirmed.map((m) => "  " + m.attributes.team_position_name + ": " + m.attributes.name).join("\n") + "\n\n";
+    }
+    if (declined.length) {
+      msg += "DECLINED (need coverage):\n" + declined.map((m) => "  " + m.attributes.team_position_name + ": " + m.attributes.name).join("\n") + "\n\n";
+    }
+
+    if (unconfirmed.length === 0 && declined.length === 0) {
+      msg += "All positions confirmed. You are good to go!";
+    } else if (declined.length > 0) {
+      msg += "Action needed: " + declined.length + " position(s) declined and need coverage.";
+    } else {
+      msg += "Action needed: Follow up with " + unconfirmed.length + " pending volunteer(s).";
+    }
+
+    const channel = overrideChannel || SLACK_USER_ID;
+    await sendSlackMessage(channel, msg);
+    console.log("Weekly summary sent successfully");
+  } catch (e) {
+    console.error("Weekly summary error:", e.message);
+  }
+}
+
+// ─── Schedule: run every Thursday at 8am Central (14:00 UTC) ─────────────────
+function startScheduler() {
+  console.log("Scheduler started — weekly summary runs every Thursday at 8am Central");
+  setInterval(async () => {
+    const now = new Date();
+    const utcHour = now.getUTCHours();
+    const utcMinute = now.getUTCMinutes();
+    const utcDay = now.getUTCDay();
+    if (utcDay === 4 && utcHour === 14 && utcMinute < 1) {
+      await sendWeeklySummary();
+    }
+  }, 60 * 1000);
 }
 
 // ─── Tool definitions for Claude ─────────────────────────────────────────────
 const tools = [
   {
     name: "get_schedule_summary",
-    description: "Get a summary of all upcoming plans for Worship Experience, Midweek Experience, and Bridge Youth. Set production_only to true to see only Production team members.",
+    description: "Get a summary of all upcoming plans for Worship Experience, Midweek Experience, and Bridge Youth including team member names, positions, and confirmation status.",
     input_schema: {
       type: "object",
       properties: {
@@ -355,7 +452,7 @@ const tools = [
   },
   {
     name: "get_plan_team",
-    description: "Get the team list for a specific service and date. Always use production_only=true unless the user specifically asks about another team. Use this for questions like 'who is serving this Sunday' or 'who is on the team for Wednesday'.",
+    description: "Get the team list for a specific service and date. Always use production_only=true unless the user asks about another team. Call this separately for each service type when multiple are requested.",
     input_schema: {
       type: "object",
       properties: {
@@ -377,7 +474,7 @@ const tools = [
   },
   {
     name: "search_people",
-    description: "Search for a person by name and get their contact info — phone and email.",
+    description: "Search for a person by name and get their contact info including phone numbers and email addresses.",
     input_schema: {
       type: "object",
       properties: {
@@ -418,7 +515,7 @@ const tools = [
 
 // ─── Execute a tool call ──────────────────────────────────────────────────────
 async function executeTool(toolName, toolInput) {
-  console.log(`Tool: ${toolName}`, JSON.stringify(toolInput));
+  console.log("Tool: " + toolName, JSON.stringify(toolInput));
   switch (toolName) {
     case "get_schedule_summary":
       return await getScheduleSummary(toolInput.production_only !== false);
@@ -432,7 +529,7 @@ async function executeTool(toolName, toolInput) {
     case "get_blockouts":       return await getBlockouts(toolInput.start_date, toolInput.end_date);
     case "get_service_times":   return await getServiceTimes();
     case "get_person_schedule": return await getPersonSchedule(toolInput.name);
-    default: return `Unknown tool: ${toolName}`;
+    default: return "Unknown tool: " + toolName;
   }
 }
 
@@ -442,7 +539,7 @@ async function sendSlackMessage(channel, text) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+      Authorization: "Bearer " + SLACK_BOT_TOKEN,
     },
     body: JSON.stringify({ channel, text }),
   });
@@ -450,121 +547,10 @@ async function sendSlackMessage(channel, text) {
   if (!data.ok) console.error("Slack send error:", data.error);
 }
 
-// ─── Scheduled Sunday summary ────────────────────────────────────────────────
-async function sendWeeklySummary(overrideChannel) {
-  console.log("Running weekly Production summary...");
-  try {
-    // Get next Sunday's Worship Experience team
-    const today = new Date();
-    const daysUntilSunday = (7 - today.getDay()) % 7 || 7;
-    const nextSunday = new Date(today);
-    nextSunday.setDate(today.getDate() + daysUntilSunday);
-    const sundayDate = nextSunday.toISOString().split("T")[0];
-
-    const sts = await getTargetServiceTypes();
-    const worshipST = sts.find((s) => s.attributes.name === "Worship Experience");
-    if (!worshipST) {
-      console.log("Weekly summary: Worship Experience not found");
-      return;
-    }
-
-    const plansData = await pcFetch(
-      `/services/v2/service_types/${worshipST.id}/plans?filter=future&order=sort_date&per_page=5`
-    );
-    const plans = plansData.data || [];
-    if (!plans.length) {
-      console.log("Weekly summary: No upcoming plans");
-      return;
-    }
-
-    // Find closest plan to next Sunday
-    const hintDate = new Date(sundayDate);
-    let targetPlan = plans[0];
-    let closest = Infinity;
-    for (const plan of plans) {
-      const diff = Math.abs(new Date(plan.attributes.sort_date) - hintDate);
-      if (diff < closest) { closest = diff; targetPlan = plan; }
-    }
-
-    const p = targetPlan.attributes;
-    const team = await getProductionMembers(worshipST.id, targetPlan.id);
-
-    const confirmed   = team.filter((m) => m.attributes.status === "C");
-    const unconfirmed = team.filter((m) => m.attributes.status === "U");
-    const declined    = team.filter((m) => m.attributes.status === "D");
-
-    const fmtDate2 = (s) => !s ? "TBD" : new Date(s).toLocaleDateString("en-US", {
-      weekday: "long", month: "long", day: "numeric", year: "numeric"
-    });
-
-    let msg = `Good morning! Here is your Production Team summary for this Sunday.
-
-`;
-    msg += `Service: ${p.title || "Worship Experience"}
-`;
-    msg += `Date: ${fmtDate2(p.sort_date)}
-
-`;
-    msg += `${confirmed.length} confirmed, ${unconfirmed.length} pending, ${declined.length} declined
-
-`;
-
-    if (confirmed.length) {
-      msg += `CONFIRMED:
-${confirmed.map((m) => `  ${m.attributes.team_position_name}: ${m.attributes.name}`).join("
-")}
-
-`;
-    }
-    if (unconfirmed.length) {
-      msg += `PENDING (need to confirm):
-${unconfirmed.map((m) => `  ${m.attributes.team_position_name}: ${m.attributes.name}`).join("
-")}
-
-`;
-    }
-    if (declined.length) {
-      msg += `DECLINED (need coverage):
-${declined.map((m) => `  ${m.attributes.team_position_name}: ${m.attributes.name}`).join("
-")}
-`;
-    }
-
-    if (unconfirmed.length === 0 && declined.length === 0) {
-      msg += "All positions confirmed. You are good to go!";
-    } else if (declined.length > 0) {
-      msg += `Action needed: ${declined.length} position(s) declined and need coverage.`;
-    } else {
-      msg += `Action needed: Follow up with ${unconfirmed.length} pending volunteer(s).`;
-    }
-
-    await sendSlackMessage(overrideChannel || process.env.SLACK_USER_ID, msg);
-    console.log("Weekly summary sent successfully");
-  } catch (e) {
-    console.error("Weekly summary error:", e.message);
-  }
-}
-
-// ─── Schedule: run every Thursday at 8am Central (14:00 UTC) ─────────────────
-function startScheduler() {
-  console.log("Scheduler started — weekly summary runs every Thursday at 8am Central");
-  setInterval(async () => {
-    const now = new Date();
-    const utcHour = now.getUTCHours();
-    const utcMinute = now.getUTCMinutes();
-    const utcDay = now.getUTCDay(); // 4 = Thursday
-
-    // Thursday at 14:00 UTC = 8am Central (CST) / 9am CDT
-    if (utcDay === 4 && utcHour === 14 && utcMinute < 1) {
-      await sendWeeklySummary();
-    }
-  }, 60 * 1000); // check every minute
-}
-
 // ─── Handle message with tool use ────────────────────────────────────────────
 async function handleMessage(userId, channelId, text) {
   if (!text) return;
-  console.log(`Message from ${userId}: ${text}`);
+  console.log("Message from " + userId + ": " + text);
 
   if (["reset", "clear"].includes(text.toLowerCase())) {
     conversations[userId] = [];
@@ -572,7 +558,6 @@ async function handleMessage(userId, channelId, text) {
     return;
   }
 
-  // Summary shortcut — triggers the weekly production summary instantly
   if (["summary", "weekly summary", "sunday summary"].includes(text.toLowerCase())) {
     await sendSlackMessage(channelId, "Pulling your Sunday Production summary...");
     await sendWeeklySummary(channelId);
@@ -599,29 +584,7 @@ async function handleMessage(userId, channelId, text) {
       body: JSON.stringify({
         model: "claude-sonnet-4-5",
         max_tokens: 1024,
-        system: `You are a Production Team AI assistant for The Bridge Church, accessed via Slack. Help the production director manage their volunteer team.
-
-Today's date is ${today}.
-
-The Bridge has these regular services:
-- Worship Experience: Sundays
-- Midweek Experience: Wednesdays
-- Bridge Youth: Wednesdays
-
-The Production team at The Bridge handles: Cameras, FOH Audio, Online Audio, Lighting, CG (graphics), TD (technical director), Producer, Photographer, Host, Stage Manager, and similar technical roles.
-
-CRITICAL RULES:
-- NEVER invent, guess, or make up names, positions, or any data. Only report what tools return.
-- ALWAYS call tools for every schedule question, even if you think you already have the data. Never use cached conversation history for schedule information — it may be stale.
-- ALWAYS use tools to fetch real data before answering questions about schedules, people, or availability.
-- When asked about multiple services, call get_plan_team separately for EACH service type requested. Do not stop after one.
-- By default always use production_only=true when fetching team data unless the user asks about other teams.
-- When asked about "this Sunday", calculate the next Sunday from today and use get_plan_team with "Worship Experience".
-- When asked about "this Wednesday" or "midweek", call get_plan_team for BOTH "Midweek Experience" AND "Bridge Youth" unless the user specifies only one.
-- If a tool returns no Production team members, say so honestly — the team may not be scheduled yet.
-- Plain text only — no markdown. Keep responses concise and practical.
-
-Commands: reset (clear history).`,
+        system: "You are a Production Team AI assistant for The Bridge Church, accessed via Slack. Help the production director manage their volunteer team.\n\nToday's date is " + today + ".\n\nThe Bridge has these regular services:\n- Worship Experience: Sundays\n- Midweek Experience: Wednesdays\n- Bridge Youth: Wednesdays\n\nThe Production team handles: Cameras, FOH Audio, Online Audio, Lighting, CG (graphics), TD (technical director), Producer, Photographer, Host, Stage Manager.\n\nCRITICAL RULES:\n- NEVER invent, guess, or make up names, positions, or any data. Only report what tools return.\n- ALWAYS call tools for every schedule question, even if you think you already have the data. Never use conversation history for schedule data.\n- When asked about multiple services, call get_plan_team separately for EACH service type. Do not stop after one.\n- Always use production_only=true when fetching team data unless the user asks about another team.\n- When asked about 'this Sunday', calculate the next Sunday from today and use get_plan_team with 'Worship Experience'.\n- When asked about 'this Wednesday' or 'midweek', call get_plan_team for BOTH 'Midweek Experience' AND 'Bridge Youth' unless only one is specified.\n- If a tool returns no Production team members, say so honestly.\n- Plain text only, no markdown. Keep responses concise and practical.\n\nCommands: reset (clear history), summary (get Sunday summary).",
         tools,
         messages,
       }),
@@ -646,16 +609,16 @@ Commands: reset (clear history).`,
       messages.push({ role: "user", content: toolResults });
     } else {
       finalReply = data.content
-        ?.filter((c) => c.type === "text")
-        .map((c) => c.text)
-        .join("") || "Sorry, I couldn't generate a response.";
+        ? data.content.filter((c) => c.type === "text").map((c) => c.text).join("")
+        : "Sorry, I could not generate a response.";
+      if (!finalReply) finalReply = "Sorry, I could not generate a response.";
       break;
     }
   }
 
   conversations[userId].push({ role: "assistant", content: finalReply });
   await sendSlackMessage(channelId, finalReply);
-  console.log(`Replied to ${userId}`);
+  console.log("Replied to " + userId);
 }
 
 // ─── Slack Events endpoint ────────────────────────────────────────────────────
@@ -680,7 +643,7 @@ app.get("/", (req, res) => res.send("Production Hub Slack server is running ✓"
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+  console.log("Server listening on port " + PORT);
   startScheduler();
 });
 
