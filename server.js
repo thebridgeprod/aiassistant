@@ -9,11 +9,12 @@ const PC_SECRET      = process.env.PC_SECRET;
 const MY_PHONE       = process.env.MY_PHONE_NUMBER;
 const SIGNAL_NUMBER  = process.env.SIGNAL_NUMBER;
 const SIGNAL_API     = process.env.SIGNAL_API || "http://signal-cli-rest-api.railway.internal:8080";
-const POLL_INTERVAL  = 3000; // poll every 3 seconds
+const POLL_INTERVAL  = 3000;
 
 // ─── In-memory state ─────────────────────────────────────────────────────────
 const conversations = {};
 let lastTimestamp = Date.now();
+let isPolling = false;
 
 // ─── Planning Center cache (5 min TTL) ──────────────────────────────────────
 let pcCache = { context: null, fetchedAt: 0 };
@@ -84,18 +85,22 @@ async function getPlanningCenterContext() {
 }
 
 async function sendSignalMessage(recipient, message) {
-  const r = await fetch(`${SIGNAL_API}/v2/send`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      message,
-      number: SIGNAL_NUMBER,
-      recipients: [recipient],
-    }),
-  });
-  if (!r.ok) {
-    const text = await r.text();
-    throw new Error(`Signal send failed: ${r.status} ${text}`);
+  try {
+    const r = await fetch(`${SIGNAL_API}/v2/send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message,
+        number: SIGNAL_NUMBER,
+        recipients: [recipient],
+      }),
+    });
+    if (!r.ok) {
+      const text = await r.text();
+      console.error(`Signal send failed: ${r.status} ${text}`);
+    }
+  } catch (e) {
+    console.error("Send error:", e.message);
   }
 }
 
@@ -122,78 +127,94 @@ async function handleMessage(from, body) {
   conversations[from].push({ role: "user", content: body });
   if (conversations[from].length > 10) conversations[from] = conversations[from].slice(-10);
 
-  const pcContext = await getPlanningCenterContext();
+  try {
+    const pcContext = await getPlanningCenterContext();
 
-  const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": ANTHROPIC_KEY,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 800,
-      system: `You are a Production Team AI assistant for a church, accessed via Signal messenger. Help the production director manage their volunteer team.
+    const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": ANTHROPIC_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 800,
+        system: `You are a Production Team AI assistant for a church, accessed via Signal messenger. Help the production director manage their volunteer team.
 
 Live Planning Center data (refreshed every 5 minutes):
 ${pcContext}
 
 Keep responses concise and practical. No markdown formatting — plain text only since this is a messaging app. For drafted messages or detailed lists, longer responses are fine.
 Commands the user can send: RESET (clear history), REFRESH (force Planning Center data update).`,
-      messages: conversations[from].map((m) => ({ role: m.role, content: m.content })),
-    }),
-  });
+        messages: conversations[from].map((m) => ({ role: m.role, content: m.content })),
+      }),
+    });
 
-  const data = await aiRes.json();
-  const reply =
-    data.content?.filter((c) => c.type === "text").map((c) => c.text).join("") ||
-    "Sorry, I couldn't respond. Try again.";
+    const data = await aiRes.json();
+    const reply =
+      data.content?.filter((c) => c.type === "text").map((c) => c.text).join("") ||
+      "Sorry, I couldn't respond. Try again.";
 
-  conversations[from].push({ role: "assistant", content: reply });
-  await sendSignalMessage(from, reply);
-  console.log(`Replied to ${from}`);
+    conversations[from].push({ role: "assistant", content: reply });
+    await sendSignalMessage(from, reply);
+    console.log(`Replied to ${from}`);
+  } catch (e) {
+    console.error("AI error:", e.message);
+    await sendSignalMessage(from, "Something went wrong. Please try again.");
+  }
 }
 
 // ─── Polling loop ─────────────────────────────────────────────────────────────
 async function pollMessages() {
+  if (isPolling) return; // prevent overlapping polls
+  isPolling = true;
   try {
-    const r = await fetch(
-      `${SIGNAL_API}/v1/receive/${encodeURIComponent(SIGNAL_NUMBER)}`,
-      { headers: { "Content-Type": "application/json" } }
-    );
+    const url = `${SIGNAL_API}/v1/receive/${encodeURIComponent(SIGNAL_NUMBER)}`;
+    const r = await fetch(url, { signal: AbortSignal.timeout(5000) });
 
-    if (!r.ok) {
-      console.error(`Poll error: ${r.status}`);
-      return;
-    }
+    if (r.status === 200) {
+      const text = await r.text();
+      if (!text || text === "null") return;
+      
+      let messages;
+      try {
+        messages = JSON.parse(text);
+      } catch {
+        return;
+      }
 
-    const messages = await r.json();
-    if (!Array.isArray(messages) || messages.length === 0) return;
+      if (!Array.isArray(messages) || messages.length === 0) return;
 
-    for (const msg of messages) {
-      const envelope = msg?.envelope;
-      if (!envelope) continue;
+      for (const msg of messages) {
+        try {
+          const envelope = msg?.envelope;
+          if (!envelope) continue;
 
-      const dataMessage = envelope?.dataMessage;
-      if (!dataMessage) continue;
+          const dataMessage = envelope?.dataMessage;
+          if (!dataMessage) continue;
 
-      // Skip old messages on startup
-      const msgTimestamp = envelope.timestamp;
-      if (msgTimestamp && msgTimestamp <= lastTimestamp) continue;
-      if (msgTimestamp) lastTimestamp = msgTimestamp;
+          const msgTimestamp = envelope.timestamp || 0;
+          if (msgTimestamp && msgTimestamp <= lastTimestamp) continue;
+          if (msgTimestamp) lastTimestamp = msgTimestamp;
 
-      const from = envelope.source;
-      const body = (dataMessage.message || "").trim();
+          const from = envelope.source;
+          const body = (dataMessage.message || "").trim();
 
-      await handleMessage(from, body);
+          await handleMessage(from, body);
+        } catch (e) {
+          console.error("Error processing individual message:", e.message);
+        }
+      }
     }
   } catch (e) {
     console.error("Poll error:", e.message);
+  } finally {
+    isPolling = false;
   }
 }
 
-// Start polling after 3 second delay
+// Start polling
 setTimeout(() => {
   console.log("Starting message polling...");
   setInterval(pollMessages, POLL_INTERVAL);
@@ -203,4 +224,10 @@ setTimeout(() => {
 app.get("/", (req, res) => res.send("Production Hub Signal server is running ✓"));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+});
+
+// Keep process alive and handle errors gracefully
+process.on("uncaughtException", (e) => console.error("Uncaught exception:", e.message));
+process.on("unhandledRejection", (e) => console.error("Unhandled rejection:", e));
