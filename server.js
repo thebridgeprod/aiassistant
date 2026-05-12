@@ -1,5 +1,4 @@
 const express = require("express");
-const WebSocket = require("ws");
 const app = express();
 app.use(express.json());
 
@@ -10,9 +9,11 @@ const PC_SECRET      = process.env.PC_SECRET;
 const MY_PHONE       = process.env.MY_PHONE_NUMBER;
 const SIGNAL_NUMBER  = process.env.SIGNAL_NUMBER;
 const SIGNAL_API     = process.env.SIGNAL_API || "http://signal-cli-rest-api.railway.internal:8080";
+const POLL_INTERVAL  = 3000; // poll every 3 seconds
 
-// ─── In-memory conversation history ─────────────────────────────────────────
+// ─── In-memory state ─────────────────────────────────────────────────────────
 const conversations = {};
+let lastTimestamp = Date.now();
 
 // ─── Planning Center cache (5 min TTL) ──────────────────────────────────────
 let pcCache = { context: null, fetchedAt: 0 };
@@ -102,6 +103,8 @@ async function handleMessage(from, body) {
   if (!body) return;
   if (MY_PHONE && from !== MY_PHONE) return;
 
+  console.log(`Message from ${from}: ${body}`);
+
   if (["reset", "clear"].includes(body.toLowerCase())) {
     conversations[from] = [];
     pcCache = { context: null, fetchedAt: 0 };
@@ -149,53 +152,52 @@ Commands the user can send: RESET (clear history), REFRESH (force Planning Cente
 
   conversations[from].push({ role: "assistant", content: reply });
   await sendSignalMessage(from, reply);
+  console.log(`Replied to ${from}`);
 }
 
-// ─── WebSocket connection to signal-cli ──────────────────────────────────────
-function connectWebSocket() {
-  // Build WebSocket URL — encode the + in the phone number
-  const wsBase = SIGNAL_API.replace("http://", "ws://").replace("https://", "wss://");
-  const encodedNumber = encodeURIComponent(SIGNAL_NUMBER);
-  const wsUrl = `${wsBase}/v1/receive/${encodedNumber}`;
+// ─── Polling loop ─────────────────────────────────────────────────────────────
+async function pollMessages() {
+  try {
+    const r = await fetch(
+      `${SIGNAL_API}/v1/receive/${encodeURIComponent(SIGNAL_NUMBER)}`,
+      { headers: { "Content-Type": "application/json" } }
+    );
 
-  console.log("Connecting to WebSocket:", wsUrl);
-  const ws = new WebSocket(wsUrl);
+    if (!r.ok) {
+      console.error(`Poll error: ${r.status}`);
+      return;
+    }
 
-  ws.on("open", () => {
-    console.log("Connected to signal-cli WebSocket successfully!");
-  });
+    const messages = await r.json();
+    if (!Array.isArray(messages) || messages.length === 0) return;
 
-  ws.on("message", async (data) => {
-    try {
-      const msg = JSON.parse(data.toString());
-      console.log("Received message:", JSON.stringify(msg));
-
+    for (const msg of messages) {
       const envelope = msg?.envelope;
-      if (!envelope) return;
+      if (!envelope) continue;
 
       const dataMessage = envelope?.dataMessage;
-      if (!dataMessage) return;
+      if (!dataMessage) continue;
+
+      // Skip old messages on startup
+      const msgTimestamp = envelope.timestamp;
+      if (msgTimestamp && msgTimestamp <= lastTimestamp) continue;
+      if (msgTimestamp) lastTimestamp = msgTimestamp;
 
       const from = envelope.source;
       const body = (dataMessage.message || "").trim();
 
       await handleMessage(from, body);
-    } catch (e) {
-      console.error("Error processing message:", e);
     }
-  });
-
-  ws.on("close", (code, reason) => {
-    console.log(`WebSocket closed (${code}: ${reason}) — reconnecting in 5 seconds...`);
-    setTimeout(connectWebSocket, 5000);
-  });
-
-  ws.on("error", (err) => {
-    console.error("WebSocket error:", err.message);
-  });
+  } catch (e) {
+    console.error("Poll error:", e.message);
+  }
 }
 
-setTimeout(connectWebSocket, 3000);
+// Start polling after 3 second delay
+setTimeout(() => {
+  console.log("Starting message polling...");
+  setInterval(pollMessages, POLL_INTERVAL);
+}, 3000);
 
 // ─── Health check ────────────────────────────────────────────────────────────
 app.get("/", (req, res) => res.send("Production Hub Signal server is running ✓"));
