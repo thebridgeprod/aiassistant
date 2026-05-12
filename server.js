@@ -100,11 +100,8 @@ async function sendSignalMessage(recipient, message) {
 
 async function handleMessage(from, body) {
   if (!body) return;
-
-  // Security: only respond to your number
   if (MY_PHONE && from !== MY_PHONE) return;
 
-  // Reset command
   if (["reset", "clear"].includes(body.toLowerCase())) {
     conversations[from] = [];
     pcCache = { context: null, fetchedAt: 0 };
@@ -112,7 +109,6 @@ async function handleMessage(from, body) {
     return;
   }
 
-  // Refresh command
   if (body.toLowerCase() === "refresh") {
     pcCache = { context: null, fetchedAt: 0 };
     await sendSignalMessage(from, "Planning Center data will refresh on your next message.");
@@ -121,10 +117,7 @@ async function handleMessage(from, body) {
 
   if (!conversations[from]) conversations[from] = [];
   conversations[from].push({ role: "user", content: body });
-
-  if (conversations[from].length > 10) {
-    conversations[from] = conversations[from].slice(-10);
-  }
+  if (conversations[from].length > 10) conversations[from] = conversations[from].slice(-10);
 
   const pcContext = await getPlanningCenterContext();
 
@@ -145,19 +138,14 @@ ${pcContext}
 
 Keep responses concise and practical. No markdown formatting — plain text only since this is a messaging app. For drafted messages or detailed lists, longer responses are fine.
 Commands the user can send: RESET (clear history), REFRESH (force Planning Center data update).`,
-      messages: conversations[from].map((m) => ({
-        role: m.role,
-        content: m.content,
-      })),
+      messages: conversations[from].map((m) => ({ role: m.role, content: m.content })),
     }),
   });
 
   const data = await aiRes.json();
   const reply =
-    data.content
-      ?.filter((c) => c.type === "text")
-      .map((c) => c.text)
-      .join("") || "Sorry, I couldn't respond. Try again.";
+    data.content?.filter((c) => c.type === "text").map((c) => c.text).join("") ||
+    "Sorry, I couldn't respond. Try again.";
 
   conversations[from].push({ role: "assistant", content: reply });
   await sendSignalMessage(from, reply);
@@ -165,17 +153,22 @@ Commands the user can send: RESET (clear history), REFRESH (force Planning Cente
 
 // ─── WebSocket connection to signal-cli ──────────────────────────────────────
 function connectWebSocket() {
-  const wsUrl = SIGNAL_API.replace("http://", "ws://").replace("https://", "wss://");
-  const ws = new WebSocket(`${wsUrl}/v1/receive/${SIGNAL_NUMBER}`);
+  // Build WebSocket URL — encode the + in the phone number
+  const wsBase = SIGNAL_API.replace("http://", "ws://").replace("https://", "wss://");
+  const encodedNumber = encodeURIComponent(SIGNAL_NUMBER);
+  const wsUrl = `${wsBase}/v1/receive/${encodedNumber}`;
+
+  console.log("Connecting to WebSocket:", wsUrl);
+  const ws = new WebSocket(wsUrl);
 
   ws.on("open", () => {
-    console.log("Connected to signal-cli WebSocket");
+    console.log("Connected to signal-cli WebSocket successfully!");
   });
 
   ws.on("message", async (data) => {
     try {
       const msg = JSON.parse(data.toString());
-      console.log("Received Signal message:", JSON.stringify(msg));
+      console.log("Received message:", JSON.stringify(msg));
 
       const envelope = msg?.envelope;
       if (!envelope) return;
@@ -192,8 +185,8 @@ function connectWebSocket() {
     }
   });
 
-  ws.on("close", () => {
-    console.log("WebSocket closed — reconnecting in 5 seconds...");
+  ws.on("close", (code, reason) => {
+    console.log(`WebSocket closed (${code}: ${reason}) — reconnecting in 5 seconds...`);
     setTimeout(connectWebSocket, 5000);
   });
 
@@ -202,7 +195,6 @@ function connectWebSocket() {
   });
 }
 
-// Start WebSocket connection after a short delay to let signal-cli initialize
 setTimeout(connectWebSocket, 3000);
 
 // ─── Health check ────────────────────────────────────────────────────────────
