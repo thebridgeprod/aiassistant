@@ -9,8 +9,9 @@ const PC_SECRET            = process.env.PC_SECRET;
 const SLACK_BOT_TOKEN      = process.env.SLACK_BOT_TOKEN;
 const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
 
-// ─── Target service types ─────────────────────────────────────────────────────
+// ─── Target service types & teams ────────────────────────────────────────────
 const TARGET_SERVICE_TYPES = ["Worship Experience", "Midweek Experience", "Bridge Youth"];
+const PRODUCTION_TEAM_NAME = "Production";
 
 // ─── In-memory state ─────────────────────────────────────────────────────────
 const conversations = {};
@@ -45,8 +46,7 @@ async function pcFetch(path) {
 
 function fmtDate(s) {
   if (!s) return "TBD";
-  const d = new Date(s);
-  return d.toLocaleDateString("en-US", {
+  return new Date(s).toLocaleDateString("en-US", {
     weekday: "short", month: "short", day: "numeric", year: "numeric",
   });
 }
@@ -58,56 +58,59 @@ function fmtTime(s) {
   });
 }
 
-// ─── Get target service type IDs ─────────────────────────────────────────────
+// ─── Get target service types ─────────────────────────────────────────────────
 async function getTargetServiceTypes() {
   const data = await pcFetch("/services/v2/service_types?per_page=25");
   const all = data.data || [];
   return all.filter((st) => TARGET_SERVICE_TYPES.includes(st.attributes.name));
 }
 
+// ─── Filter team members to Production team only ─────────────────────────────
+function filterProductionTeam(teamMembers) {
+  return teamMembers.filter((m) => {
+    const teamName = m.attributes.team_name || "";
+    return teamName.toLowerCase().includes(PRODUCTION_TEAM_NAME.toLowerCase());
+  });
+}
+
 // ─── Planning Center Tools ────────────────────────────────────────────────────
 
-async function getScheduleSummary() {
+async function getScheduleSummary(productionOnly = false) {
   try {
     const sts = await getTargetServiceTypes();
-    if (!sts.length) return "Could not find Worship Experience, Midweek Experience, or Bridge Youth service types in Planning Center.";
+    if (!sts.length) return "Could not find Worship Experience, Midweek Experience, or Bridge Youth in Planning Center.";
 
     let ctx = "";
 
     for (const st of sts) {
       const plansData = await pcFetch(
-        `/services/v2/service_types/${st.id}/plans?filter=future&order=sort_date&per_page=3`
+        `/services/v2/service_types/${st.id}/plans?filter=future&order=sort_date&per_page=2`
       );
       const plans = plansData.data || [];
 
       if (!plans.length) {
-        ctx += `\n[${st.attributes.name}] No upcoming plans found.\n`;
+        ctx += `\n[${st.attributes.name}] No upcoming plans.\n`;
         continue;
       }
 
       for (const plan of plans.slice(0, 2)) {
         const p = plan.attributes;
-        ctx += `\n[${st.attributes.name}] "${p.title || "Service"}" on ${fmtDate(p.sort_date)} (Plan ID: ${plan.id})\n`;
-
         const teamData = await pcFetch(
-          `/services/v2/service_types/${st.id}/plans/${plan.id}/team_members?per_page=50`
+          `/services/v2/service_types/${st.id}/plans/${plan.id}/team_members?per_page=100`
         );
-        const team = teamData.data || [];
+        let team = teamData.data || [];
+        if (productionOnly) team = filterProductionTeam(team);
+
         const confirmed   = team.filter((m) => m.attributes.status === "C");
         const unconfirmed = team.filter((m) => m.attributes.status === "U");
         const declined    = team.filter((m) => m.attributes.status === "D");
 
+        ctx += `\n[${st.attributes.name}] "${p.title || "Service"}" on ${fmtDate(p.sort_date)}\n`;
         ctx += `  ${confirmed.length} confirmed, ${unconfirmed.length} pending, ${declined.length} declined\n`;
 
-        if (confirmed.length) {
-          ctx += `  Confirmed: ${confirmed.map((m) => `${m.attributes.name} (${m.attributes.team_position_name || "Team"})`).join(", ")}\n`;
-        }
-        if (unconfirmed.length) {
-          ctx += `  Pending: ${unconfirmed.map((m) => `${m.attributes.name} (${m.attributes.team_position_name || "Team"})`).join(", ")}\n`;
-        }
-        if (declined.length) {
-          ctx += `  Declined: ${declined.map((m) => `${m.attributes.name} (${m.attributes.team_position_name || "Team"})`).join(", ")}\n`;
-        }
+        if (confirmed.length) ctx += `  Confirmed: ${confirmed.map((m) => `${m.attributes.name} (${m.attributes.team_position_name})`).join(", ")}\n`;
+        if (unconfirmed.length) ctx += `  Pending: ${unconfirmed.map((m) => `${m.attributes.name} (${m.attributes.team_position_name})`).join(", ")}\n`;
+        if (declined.length) ctx += `  Declined: ${declined.map((m) => `${m.attributes.name} (${m.attributes.team_position_name})`).join(", ")}\n`;
       }
     }
 
@@ -117,7 +120,7 @@ async function getScheduleSummary() {
   }
 }
 
-async function getPlanTeam(serviceTypeName, dateHint) {
+async function getPlanTeam(serviceTypeName, dateHint, productionOnly = true) {
   try {
     const sts = await getTargetServiceTypes();
     const st = sts.find((s) =>
@@ -132,7 +135,6 @@ async function getPlanTeam(serviceTypeName, dateHint) {
     const plans = plansData.data || [];
     if (!plans.length) return `No upcoming plans found for ${st.attributes.name}.`;
 
-    // Find the plan closest to the date hint
     let targetPlan = plans[0];
     if (dateHint) {
       const hintDate = new Date(dateHint);
@@ -149,27 +151,32 @@ async function getPlanTeam(serviceTypeName, dateHint) {
 
     const p = targetPlan.attributes;
     const teamData = await pcFetch(
-      `/services/v2/service_types/${st.id}/plans/${targetPlan.id}/team_members?per_page=50`
+      `/services/v2/service_types/${st.id}/plans/${targetPlan.id}/team_members?per_page=100`
     );
-    const team = teamData.data || [];
+    let team = teamData.data || [];
+    if (productionOnly) team = filterProductionTeam(team);
 
-    if (!team.length) return `No team members scheduled for ${st.attributes.name} on ${fmtDate(p.sort_date)}.`;
+    if (!team.length) {
+      return productionOnly
+        ? `No Production team members scheduled for ${st.attributes.name} on ${fmtDate(p.sort_date)}. The team may not be scheduled yet.`
+        : `No team members scheduled for ${st.attributes.name} on ${fmtDate(p.sort_date)}.`;
+    }
 
     const confirmed   = team.filter((m) => m.attributes.status === "C");
     const unconfirmed = team.filter((m) => m.attributes.status === "U");
     const declined    = team.filter((m) => m.attributes.status === "D");
 
     let result = `${st.attributes.name} — ${p.title || "Service"} on ${fmtDate(p.sort_date)}\n`;
-    result += `${confirmed.length} confirmed, ${unconfirmed.length} pending, ${declined.length} declined\n\n`;
+    result += `Production Team: ${confirmed.length} confirmed, ${unconfirmed.length} pending, ${declined.length} declined\n\n`;
 
     if (confirmed.length) {
-      result += `CONFIRMED:\n${confirmed.map((m) => `  ${m.attributes.team_position_name || "Team"}: ${m.attributes.name}`).join("\n")}\n\n`;
+      result += `CONFIRMED:\n${confirmed.map((m) => `  ${m.attributes.team_position_name}: ${m.attributes.name}`).join("\n")}\n\n`;
     }
     if (unconfirmed.length) {
-      result += `PENDING:\n${unconfirmed.map((m) => `  ${m.attributes.team_position_name || "Team"}: ${m.attributes.name}`).join("\n")}\n\n`;
+      result += `PENDING:\n${unconfirmed.map((m) => `  ${m.attributes.team_position_name}: ${m.attributes.name}`).join("\n")}\n\n`;
     }
     if (declined.length) {
-      result += `DECLINED:\n${declined.map((m) => `  ${m.attributes.team_position_name || "Team"}: ${m.attributes.name}`).join("\n")}\n`;
+      result += `DECLINED:\n${declined.map((m) => `  ${m.attributes.team_position_name}: ${m.attributes.name}`).join("\n")}\n`;
     }
 
     return result;
@@ -213,21 +220,14 @@ async function getBlockouts(startDate, endDate) {
     const start = startDate || new Date().toISOString().split("T")[0];
     const end = endDate || new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
 
-    const data = await pcFetch(
-      `/services/v2/blockouts?filter=future&per_page=50`
-    );
+    const data = await pcFetch(`/services/v2/blockouts?filter=future&per_page=50`);
     const blockouts = data.data || [];
-    if (!blockouts.length) return `No blockouts found.`;
-
     const included = data.included || [];
 
-    // Filter to date range
     const filtered = blockouts.filter((b) => {
       const bStart = new Date(b.attributes.starts_at);
       const bEnd = new Date(b.attributes.ends_at);
-      const rangeStart = new Date(start);
-      const rangeEnd = new Date(end);
-      return bStart <= rangeEnd && bEnd >= rangeStart;
+      return bStart <= new Date(end) && bEnd >= new Date(start);
     });
 
     if (!filtered.length) return `No blockouts found between ${start} and ${end}.`;
@@ -236,9 +236,7 @@ async function getBlockouts(startDate, endDate) {
       const attr = b.attributes;
       const personId = b.relationships?.person?.data?.id;
       const person = included.find((i) => i.id === personId);
-      const personName = person
-        ? `${person.attributes.first_name} ${person.attributes.last_name}`
-        : "Unknown";
+      const personName = person ? `${person.attributes.first_name} ${person.attributes.last_name}` : "Unknown";
       return `${personName}: ${fmtDate(attr.starts_at)} to ${fmtDate(attr.ends_at)}${attr.reason ? ` — ${attr.reason}` : ""}`;
     }).join("\n");
   } catch (e) {
@@ -257,7 +255,7 @@ async function getServiceTimes() {
       );
       const plans = plansData.data || [];
 
-      for (const plan of plans.slice(0, 2)) {
+      for (const plan of plans.slice(0, 1)) {
         const p = plan.attributes;
         const timesData = await pcFetch(
           `/services/v2/service_types/${st.id}/plans/${plan.id}/plan_times`
@@ -311,12 +309,21 @@ async function getPersonSchedule(name) {
 const tools = [
   {
     name: "get_schedule_summary",
-    description: "Get a full summary of all upcoming plans for Worship Experience, Midweek Experience, and Bridge Youth — including every team member's name, position, and confirmation status. Use this for general schedule overviews.",
-    input_schema: { type: "object", properties: {}, required: [] },
+    description: "Get a summary of all upcoming plans for Worship Experience, Midweek Experience, and Bridge Youth. Set production_only to true to see only Production team members.",
+    input_schema: {
+      type: "object",
+      properties: {
+        production_only: {
+          type: "boolean",
+          description: "If true, only show Production team members. Default true.",
+        },
+      },
+      required: [],
+    },
   },
   {
     name: "get_plan_team",
-    description: "Get the complete team list for a specific service type and date. Use this when asked about who is serving on a specific day or for a specific service. Always use this instead of guessing names.",
+    description: "Get the team list for a specific service and date. Always use production_only=true unless the user specifically asks about another team. Use this for questions like 'who is serving this Sunday' or 'who is on the team for Wednesday'.",
     input_schema: {
       type: "object",
       properties: {
@@ -326,7 +333,11 @@ const tools = [
         },
         date_hint: {
           type: "string",
-          description: "A date in YYYY-MM-DD format to find the closest plan to. Use today's date to calculate upcoming Sundays or Wednesdays.",
+          description: "Date in YYYY-MM-DD format to find the closest plan to.",
+        },
+        production_only: {
+          type: "boolean",
+          description: "If true, only show Production team members. Default true.",
         },
       },
       required: ["service_type_name"],
@@ -334,18 +345,18 @@ const tools = [
   },
   {
     name: "search_people",
-    description: "Search for a person by name and get their contact information — phone numbers and email addresses.",
+    description: "Search for a person by name and get their contact info — phone and email.",
     input_schema: {
       type: "object",
       properties: {
-        name: { type: "string", description: "The person's name to search for" },
+        name: { type: "string", description: "The person's name" },
       },
       required: ["name"],
     },
   },
   {
     name: "get_blockouts",
-    description: "Get a list of people who have blocked out their availability within a date range.",
+    description: "Get people who have blocked out their availability within a date range.",
     input_schema: {
       type: "object",
       properties: {
@@ -377,12 +388,18 @@ const tools = [
 async function executeTool(toolName, toolInput) {
   console.log(`Tool: ${toolName}`, JSON.stringify(toolInput));
   switch (toolName) {
-    case "get_schedule_summary":   return await getScheduleSummary();
-    case "get_plan_team":          return await getPlanTeam(toolInput.service_type_name, toolInput.date_hint);
-    case "search_people":          return await searchPeople(toolInput.name);
-    case "get_blockouts":          return await getBlockouts(toolInput.start_date, toolInput.end_date);
-    case "get_service_times":      return await getServiceTimes();
-    case "get_person_schedule":    return await getPersonSchedule(toolInput.name);
+    case "get_schedule_summary":
+      return await getScheduleSummary(toolInput.production_only !== false);
+    case "get_plan_team":
+      return await getPlanTeam(
+        toolInput.service_type_name,
+        toolInput.date_hint,
+        toolInput.production_only !== false
+      );
+    case "search_people":       return await searchPeople(toolInput.name);
+    case "get_blockouts":       return await getBlockouts(toolInput.start_date, toolInput.end_date);
+    case "get_service_times":   return await getServiceTimes();
+    case "get_person_schedule": return await getPersonSchedule(toolInput.name);
     default: return `Unknown tool: ${toolName}`;
   }
 }
@@ -412,11 +429,6 @@ async function handleMessage(userId, channelId, text) {
     return;
   }
 
-  if (text.toLowerCase() === "refresh") {
-    await sendSlackMessage(channelId, "Ready — ask me anything and I'll pull fresh data.");
-    return;
-  }
-
   if (!conversations[userId]) conversations[userId] = [];
   conversations[userId].push({ role: "user", content: text });
   if (conversations[userId].length > 20) conversations[userId] = conversations[userId].slice(-20);
@@ -443,18 +455,21 @@ Today's date is ${today}.
 
 The Bridge has these regular services:
 - Worship Experience: Sundays
-- Midweek Experience: Wednesdays  
+- Midweek Experience: Wednesdays
 - Bridge Youth: Wednesdays
 
-CRITICAL RULES:
-- NEVER invent, guess, or make up names, positions, or any data. If you don't have data from a tool, say so.
-- ALWAYS use tools to fetch real data before answering questions about schedules, people, or availability.
-- When asked about "this Sunday", calculate the date of the next Sunday from today and use get_plan_team with service_type_name "Worship Experience" and that date.
-- When asked about "this week's services", fetch both Worship Experience (Sunday) and Midweek/Bridge Youth (Wednesday).
-- If a tool returns no data for a specific date, tell the user honestly rather than guessing.
+The Production team at The Bridge handles: Cameras, FOH Audio, Online Audio, Lighting, CG (graphics), TD (technical director), Producer, Photographer, Host, Stage Manager, and similar technical roles.
 
-Plain text only — no markdown formatting. Keep responses concise and practical.
-Commands: reset (clear history), refresh (fresh start).`,
+CRITICAL RULES:
+- NEVER invent, guess, or make up names, positions, or any data. Only report what tools return.
+- ALWAYS use tools to fetch real data before answering questions about schedules, people, or availability.
+- By default always use production_only=true when fetching team data unless the user asks about other teams.
+- When asked about "this Sunday", calculate the next Sunday from today and use get_plan_team with "Worship Experience".
+- When asked about "this Wednesday" or "this week's midweek", use get_plan_team with "Midweek Experience".
+- If a tool returns no Production team members, say so honestly — the team may not be scheduled yet.
+- Plain text only — no markdown. Keep responses concise and practical.
+
+Commands: reset (clear history).`,
         tools,
         messages,
       }),
