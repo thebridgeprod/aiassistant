@@ -65,38 +65,36 @@ async function getTargetServiceTypes() {
   return all.filter((st) => TARGET_SERVICE_TYPES.includes(st.attributes.name));
 }
 
-// ─── Get Production team ID for a plan ───────────────────────────────────────
-async function getProductionTeamId(serviceTypeId, planId) {
-  try {
-    const data = await pcFetch(
-      `/services/v2/service_types/${serviceTypeId}/plans/${planId}/teams?per_page=25`
-    );
-    const teams = data.data || [];
-    console.log("Teams found:", teams.map((t) => t.attributes.name));
-    const prodTeam = teams.find((t) =>
-      t.attributes.name.toLowerCase().includes(PRODUCTION_TEAM_NAME.toLowerCase())
-    );
-    return prodTeam ? prodTeam.id : null;
-  } catch (e) {
-    console.error("Error fetching teams:", e.message);
-    return null;
-  }
-}
-
 // ─── Get only Production team members for a plan ─────────────────────────────
 async function getProductionMembers(serviceTypeId, planId) {
-  const teamId = await getProductionTeamId(serviceTypeId, planId);
-  if (!teamId) {
-    console.log("No Production team found, returning all members");
-    const data = await pcFetch(
-      `/services/v2/service_types/${serviceTypeId}/plans/${planId}/team_members?per_page=100`
-    );
-    return data.data || [];
-  }
+  // Fetch team members with team relationship included
   const data = await pcFetch(
-    `/services/v2/service_types/${serviceTypeId}/plans/${planId}/team_members?filter=team&where[team_id]=${teamId}&per_page=100`
+    `/services/v2/service_types/${serviceTypeId}/plans/${planId}/team_members?include=team&per_page=100`
   );
-  return data.data || [];
+  const members = data.data || [];
+  const included = data.included || [];
+
+  // Log team names for debugging
+  const teamNames = [...new Set(included.filter(i => i.type === "Team").map(i => i.attributes.name))];
+  console.log("Teams included:", JSON.stringify(teamNames));
+
+  // Find the Production team ID from included
+  const prodTeam = included.find((i) =>
+    i.type === "Team" && i.attributes.name.toLowerCase().includes(PRODUCTION_TEAM_NAME.toLowerCase())
+  );
+
+  if (!prodTeam) {
+    console.log("No Production team found in included, returning all members");
+    return members;
+  }
+
+  console.log("Found Production team:", prodTeam.attributes.name, "ID:", prodTeam.id);
+
+  // Filter members to only those on the Production team
+  return members.filter((m) => {
+    const teamRel = m.relationships?.team?.data;
+    return teamRel && teamRel.id === prodTeam.id;
+  });
 }
 
 // ─── Planning Center Tools ────────────────────────────────────────────────────
