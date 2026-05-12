@@ -1,17 +1,19 @@
 const express = require("express");
 const app = express();
-app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
 
 // ─── Environment variables (set these in Railway) ────────────────────────────
 const ANTHROPIC_KEY  = process.env.ANTHROPIC_API_KEY;
 const PC_APP_ID      = process.env.PC_APP_ID;
 const PC_SECRET      = process.env.PC_SECRET;
-const MY_PHONE       = process.env.MY_PHONE_NUMBER; // e.g. +14051234567
+const MY_PHONE       = process.env.MY_PHONE_NUMBER;  // your personal Signal number e.g. +14051234567
+const SIGNAL_NUMBER  = process.env.SIGNAL_NUMBER;    // Google Voice number e.g. +14051112222
+const SIGNAL_API     = process.env.SIGNAL_API || "http://localhost:8080";
 
-// ─── In-memory conversation history (resets if server restarts) ──────────────
+// ─── In-memory conversation history ─────────────────────────────────────────
 const conversations = {};
 
-// ─── Simple 5-minute cache for Planning Center data ──────────────────────────
+// ─── Planning Center cache (5 min TTL) ──────────────────────────────────────
 let pcCache = { context: null, fetchedAt: 0 };
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -32,11 +34,9 @@ async function pcFetch(path) {
 }
 
 async function getPlanningCenterContext() {
-  // Return cached data if it's less than 5 minutes old
   if (pcCache.context && Date.now() - pcCache.fetchedAt < 5 * 60 * 1000) {
     return pcCache.context;
   }
-
   try {
     const stData = await pcFetch("/services/v2/service_types?per_page=10");
     const sts = stData.data || [];
@@ -44,7 +44,6 @@ async function getPlanningCenterContext() {
 
     let ctx = `Service types: ${sts.map((s) => s.attributes.name).join(", ")}.\n`;
 
-    // Pull upcoming plans for each service type (up to 2 types)
     for (const st of sts.slice(0, 2)) {
       const plansData = await pcFetch(
         `/services/v2/service_types/${st.id}/plans?filter=future&order=sort_date&per_page=3`
@@ -54,7 +53,6 @@ async function getPlanningCenterContext() {
       for (const plan of plans.slice(0, 2)) {
         const p = plan.attributes;
         ctx += `\n[${st.attributes.name}] "${p.title || "Service"}" on ${fmtDate(p.sort_date)}\n`;
-
         try {
           const teamData = await pcFetch(
             `/services/v2/service_types/${st.id}/plans/${plan.id}/team_members?per_page=40`
@@ -63,9 +61,7 @@ async function getPlanningCenterContext() {
           const confirmed   = team.filter((m) => m.attributes.status === "C");
           const unconfirmed = team.filter((m) => m.attributes.status === "U");
           const declined    = team.filter((m) => m.attributes.status === "D");
-
           ctx += `  Team: ${confirmed.length} confirmed, ${unconfirmed.length} pending, ${declined.length} declined\n`;
-
           if (unconfirmed.length) {
             ctx += `  Pending: ${unconfirmed.map((m) => `${m.attributes.name} (${m.attributes.team_position_name || "team"})`).join(", ")}\n`;
           }
@@ -85,53 +81,66 @@ async function getPlanningCenterContext() {
   }
 }
 
-function xmlEscape(str) {
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+async function sendSignalMessage(recipient, message) {
+  const r = await fetch(`${SIGNAL_API}/v2/send`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      message,
+      number: SIGNAL_NUMBER,
+      recipients: [recipient],
+    }),
+  });
+  if (!r.ok) {
+    const text = await r.text();
+    throw new Error(`Signal send failed: ${r.status} ${text}`);
+  }
 }
 
-function twimlReply(message) {
-  return `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${xmlEscape(message)}</Message></Response>`;
-}
-
-// ─── SMS webhook ─────────────────────────────────────────────────────────────
-app.post("/sms", async (req, res) => {
-  const from = req.body.From;
-  const body = (req.body.Body || "").trim();
-
-  res.type("text/xml");
-
-  // Security: ignore texts from unknown numbers
-  if (MY_PHONE && from !== MY_PHONE) {
-    return res.send(`<?xml version="1.0" encoding="UTF-8"?><Response></Response>`);
-  }
-
-  // "reset" clears conversation history
-  if (["reset", "clear"].includes(body.toLowerCase())) {
-    conversations[from] = [];
-    pcCache = { context: null, fetchedAt: 0 }; // also bust the PC cache
-    return res.send(twimlReply("Cleared! Fresh start. What do you need?"));
-  }
-
-  // "refresh" forces a fresh Planning Center pull
-  if (body.toLowerCase() === "refresh") {
-    pcCache = { context: null, fetchedAt: 0 };
-    return res.send(twimlReply("Planning Center data will refresh on your next message."));
-  }
-
-  // Initialize history for this number
-  if (!conversations[from]) conversations[from] = [];
-  conversations[from].push({ role: "user", content: body });
-
-  // Keep last 10 messages to stay within token limits
-  if (conversations[from].length > 10) {
-    conversations[from] = conversations[from].slice(-10);
-  }
+// ─── Signal webhook ──────────────────────────────────────────────────────────
+app.post("/signal", async (req, res) => {
+  res.sendStatus(200); // acknowledge immediately
 
   try {
+    const envelope = req.body?.envelope;
+    if (!envelope) return;
+
+    // Only handle data messages (ignore receipts, typing indicators, etc.)
+    const dataMessage = envelope?.dataMessage;
+    if (!dataMessage) return;
+
+    const from = envelope.source;
+    const body = (dataMessage.message || "").trim();
+
+    if (!body) return;
+
+    // Security: only respond to your number
+    if (MY_PHONE && from !== MY_PHONE) return;
+
+    // Reset command
+    if (["reset", "clear"].includes(body.toLowerCase())) {
+      conversations[from] = [];
+      pcCache = { context: null, fetchedAt: 0 };
+      await sendSignalMessage(from, "Cleared! Fresh start. What do you need?");
+      return;
+    }
+
+    // Refresh command
+    if (body.toLowerCase() === "refresh") {
+      pcCache = { context: null, fetchedAt: 0 };
+      await sendSignalMessage(from, "Planning Center data will refresh on your next message.");
+      return;
+    }
+
+    // Initialize conversation
+    if (!conversations[from]) conversations[from] = [];
+    conversations[from].push({ role: "user", content: body });
+
+    // Keep last 10 messages
+    if (conversations[from].length > 10) {
+      conversations[from] = conversations[from].slice(-10);
+    }
+
     const pcContext = await getPlanningCenterContext();
 
     const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
@@ -143,18 +152,14 @@ app.post("/sms", async (req, res) => {
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 500,
-        system: `You are a Production Team AI assistant for a church, accessed via SMS. Help the production director manage their volunteer team.
+        max_tokens: 800,
+        system: `You are a Production Team AI assistant for a church, accessed via Signal messenger. Help the production director manage their volunteer team.
 
 Live Planning Center data (refreshed every 5 minutes):
 ${pcContext}
 
-SMS rules:
-- Keep most replies under 320 characters (1-2 texts)
-- For drafted messages or lists, longer is fine
-- Be direct, warm, and practical
-- No markdown — plain text only
-- Commands the user can send: RESET (clear history), REFRESH (force PC data update)`,
+Keep responses concise and practical. No markdown formatting — plain text only since this is a messaging app. For drafted messages or detailed lists, longer responses are fine.
+Commands the user can send: RESET (clear history), REFRESH (force Planning Center data update).`,
         messages: conversations[from].map((m) => ({
           role: m.role,
           content: m.content,
@@ -170,15 +175,19 @@ SMS rules:
         .join("") || "Sorry, I couldn't respond. Try again.";
 
     conversations[from].push({ role: "assistant", content: reply });
-    return res.send(twimlReply(reply));
+    await sendSignalMessage(from, reply);
+
   } catch (e) {
-    console.error("Error:", e);
-    return res.send(twimlReply(`Something went wrong: ${e.message.slice(0, 100)}`));
+    console.error("Error handling Signal message:", e);
+    try {
+      const from = req.body?.envelope?.source;
+      if (from) await sendSignalMessage(from, `Something went wrong: ${e.message.slice(0, 100)}`);
+    } catch {}
   }
 });
 
-// Health check
-app.get("/", (req, res) => res.send("Production Hub SMS server is running ✓"));
+// ─── Health check ────────────────────────────────────────────────────────────
+app.get("/", (req, res) => res.send("Production Hub Signal server is running ✓"));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
