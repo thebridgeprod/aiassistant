@@ -67,6 +67,9 @@ async function getTargetServiceTypes() {
 
 // ─── Filter team members to Production team only ─────────────────────────────
 function filterProductionTeam(teamMembers) {
+  const teamNames = [...new Set(teamMembers.map((m) => m.attributes.team_name || "NO_TEAM_NAME"))];
+  console.log("Team names found:", JSON.stringify(teamNames));
+  console.log("Sample member attributes:", JSON.stringify(teamMembers[0]?.attributes));
   return teamMembers.filter((m) => {
     const teamName = m.attributes.team_name || "";
     return teamName.toLowerCase().includes(PRODUCTION_TEAM_NAME.toLowerCase());
