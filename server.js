@@ -171,7 +171,7 @@ async function pollMessages() {
   isPolling = true;
   try {
     const url = `${SIGNAL_API}/v1/receive/${encodeURIComponent(SIGNAL_NUMBER)}`;
-    const r = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    const r = await fetch(url, { signal: AbortSignal.timeout(30000) });
 
     if (r.status === 200) {
       const text = await r.text();
