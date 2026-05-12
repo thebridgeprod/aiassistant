@@ -450,6 +450,117 @@ async function sendSlackMessage(channel, text) {
   if (!data.ok) console.error("Slack send error:", data.error);
 }
 
+// ─── Scheduled Sunday summary ────────────────────────────────────────────────
+async function sendWeeklySummary(overrideChannel) {
+  console.log("Running weekly Production summary...");
+  try {
+    // Get next Sunday's Worship Experience team
+    const today = new Date();
+    const daysUntilSunday = (7 - today.getDay()) % 7 || 7;
+    const nextSunday = new Date(today);
+    nextSunday.setDate(today.getDate() + daysUntilSunday);
+    const sundayDate = nextSunday.toISOString().split("T")[0];
+
+    const sts = await getTargetServiceTypes();
+    const worshipST = sts.find((s) => s.attributes.name === "Worship Experience");
+    if (!worshipST) {
+      console.log("Weekly summary: Worship Experience not found");
+      return;
+    }
+
+    const plansData = await pcFetch(
+      `/services/v2/service_types/${worshipST.id}/plans?filter=future&order=sort_date&per_page=5`
+    );
+    const plans = plansData.data || [];
+    if (!plans.length) {
+      console.log("Weekly summary: No upcoming plans");
+      return;
+    }
+
+    // Find closest plan to next Sunday
+    const hintDate = new Date(sundayDate);
+    let targetPlan = plans[0];
+    let closest = Infinity;
+    for (const plan of plans) {
+      const diff = Math.abs(new Date(plan.attributes.sort_date) - hintDate);
+      if (diff < closest) { closest = diff; targetPlan = plan; }
+    }
+
+    const p = targetPlan.attributes;
+    const team = await getProductionMembers(worshipST.id, targetPlan.id);
+
+    const confirmed   = team.filter((m) => m.attributes.status === "C");
+    const unconfirmed = team.filter((m) => m.attributes.status === "U");
+    const declined    = team.filter((m) => m.attributes.status === "D");
+
+    const fmtDate2 = (s) => !s ? "TBD" : new Date(s).toLocaleDateString("en-US", {
+      weekday: "long", month: "long", day: "numeric", year: "numeric"
+    });
+
+    let msg = `Good morning! Here is your Production Team summary for this Sunday.
+
+`;
+    msg += `Service: ${p.title || "Worship Experience"}
+`;
+    msg += `Date: ${fmtDate2(p.sort_date)}
+
+`;
+    msg += `${confirmed.length} confirmed, ${unconfirmed.length} pending, ${declined.length} declined
+
+`;
+
+    if (confirmed.length) {
+      msg += `CONFIRMED:
+${confirmed.map((m) => `  ${m.attributes.team_position_name}: ${m.attributes.name}`).join("
+")}
+
+`;
+    }
+    if (unconfirmed.length) {
+      msg += `PENDING (need to confirm):
+${unconfirmed.map((m) => `  ${m.attributes.team_position_name}: ${m.attributes.name}`).join("
+")}
+
+`;
+    }
+    if (declined.length) {
+      msg += `DECLINED (need coverage):
+${declined.map((m) => `  ${m.attributes.team_position_name}: ${m.attributes.name}`).join("
+")}
+`;
+    }
+
+    if (unconfirmed.length === 0 && declined.length === 0) {
+      msg += "All positions confirmed. You are good to go!";
+    } else if (declined.length > 0) {
+      msg += `Action needed: ${declined.length} position(s) declined and need coverage.`;
+    } else {
+      msg += `Action needed: Follow up with ${unconfirmed.length} pending volunteer(s).`;
+    }
+
+    await sendSlackMessage(overrideChannel || process.env.SLACK_USER_ID, msg);
+    console.log("Weekly summary sent successfully");
+  } catch (e) {
+    console.error("Weekly summary error:", e.message);
+  }
+}
+
+// ─── Schedule: run every Thursday at 8am Central (14:00 UTC) ─────────────────
+function startScheduler() {
+  console.log("Scheduler started — weekly summary runs every Thursday at 8am Central");
+  setInterval(async () => {
+    const now = new Date();
+    const utcHour = now.getUTCHours();
+    const utcMinute = now.getUTCMinutes();
+    const utcDay = now.getUTCDay(); // 4 = Thursday
+
+    // Thursday at 14:00 UTC = 8am Central (CST) / 9am CDT
+    if (utcDay === 4 && utcHour === 14 && utcMinute < 1) {
+      await sendWeeklySummary();
+    }
+  }, 60 * 1000); // check every minute
+}
+
 // ─── Handle message with tool use ────────────────────────────────────────────
 async function handleMessage(userId, channelId, text) {
   if (!text) return;
@@ -458,6 +569,13 @@ async function handleMessage(userId, channelId, text) {
   if (["reset", "clear"].includes(text.toLowerCase())) {
     conversations[userId] = [];
     await sendSlackMessage(channelId, "Cleared! Fresh start. What do you need?");
+    return;
+  }
+
+  // Summary shortcut — triggers the weekly production summary instantly
+  if (["summary", "weekly summary", "sunday summary"].includes(text.toLowerCase())) {
+    await sendSlackMessage(channelId, "Pulling your Sunday Production summary...");
+    await sendWeeklySummary(channelId);
     return;
   }
 
@@ -494,10 +612,12 @@ The Production team at The Bridge handles: Cameras, FOH Audio, Online Audio, Lig
 
 CRITICAL RULES:
 - NEVER invent, guess, or make up names, positions, or any data. Only report what tools return.
+- ALWAYS call tools for every schedule question, even if you think you already have the data. Never use cached conversation history for schedule information — it may be stale.
 - ALWAYS use tools to fetch real data before answering questions about schedules, people, or availability.
+- When asked about multiple services, call get_plan_team separately for EACH service type requested. Do not stop after one.
 - By default always use production_only=true when fetching team data unless the user asks about other teams.
 - When asked about "this Sunday", calculate the next Sunday from today and use get_plan_team with "Worship Experience".
-- When asked about "this Wednesday" or "this week's midweek", use get_plan_team with "Midweek Experience".
+- When asked about "this Wednesday" or "midweek", call get_plan_team for BOTH "Midweek Experience" AND "Bridge Youth" unless the user specifies only one.
 - If a tool returns no Production team members, say so honestly — the team may not be scheduled yet.
 - Plain text only — no markdown. Keep responses concise and practical.
 
@@ -559,7 +679,10 @@ app.post("/slack/events", async (req, res) => {
 app.get("/", (req, res) => res.send("Production Hub Slack server is running ✓"));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+  startScheduler();
+});
 
 process.on("uncaughtException", (e) => console.error("Uncaught exception:", e.message, e.stack));
 process.on("unhandledRejection", (e) => console.error("Unhandled rejection:", e));
