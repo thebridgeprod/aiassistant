@@ -1,7 +1,7 @@
 {
   "name": "production-hub-sms",
   "version": "1.0.0",
-  "description": "Church production team AI assistant via SMS",
+  "description": "Church production team AI assistant via Signal",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -10,6 +10,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "ws": "^8.16.0"
   }
 }

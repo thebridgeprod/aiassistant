@@ -1,14 +1,15 @@
 const express = require("express");
+const WebSocket = require("ws");
 const app = express();
 app.use(express.json());
 
-// ─── Environment variables (set these in Railway) ────────────────────────────
+// ─── Environment variables ────────────────────────────────────────────────────
 const ANTHROPIC_KEY  = process.env.ANTHROPIC_API_KEY;
 const PC_APP_ID      = process.env.PC_APP_ID;
 const PC_SECRET      = process.env.PC_SECRET;
-const MY_PHONE       = process.env.MY_PHONE_NUMBER;  // your personal Signal number e.g. +14051234567
-const SIGNAL_NUMBER  = process.env.SIGNAL_NUMBER;    // Google Voice number e.g. +14051112222
-const SIGNAL_API     = process.env.SIGNAL_API || "http://localhost:8080";
+const MY_PHONE       = process.env.MY_PHONE_NUMBER;
+const SIGNAL_NUMBER  = process.env.SIGNAL_NUMBER;
+const SIGNAL_API     = process.env.SIGNAL_API || "http://signal-cli-rest-api.railway.internal:8080";
 
 // ─── In-memory conversation history ─────────────────────────────────────────
 const conversations = {};
@@ -97,94 +98,112 @@ async function sendSignalMessage(recipient, message) {
   }
 }
 
-// ─── Signal webhook ──────────────────────────────────────────────────────────
-app.post("/signal", async (req, res) => {
-  res.sendStatus(200); // acknowledge immediately
+async function handleMessage(from, body) {
+  if (!body) return;
 
-  try {
-    const envelope = req.body?.envelope;
-    if (!envelope) return;
+  // Security: only respond to your number
+  if (MY_PHONE && from !== MY_PHONE) return;
 
-    // Only handle data messages (ignore receipts, typing indicators, etc.)
-    const dataMessage = envelope?.dataMessage;
-    if (!dataMessage) return;
+  // Reset command
+  if (["reset", "clear"].includes(body.toLowerCase())) {
+    conversations[from] = [];
+    pcCache = { context: null, fetchedAt: 0 };
+    await sendSignalMessage(from, "Cleared! Fresh start. What do you need?");
+    return;
+  }
 
-    const from = envelope.source;
-    const body = (dataMessage.message || "").trim();
+  // Refresh command
+  if (body.toLowerCase() === "refresh") {
+    pcCache = { context: null, fetchedAt: 0 };
+    await sendSignalMessage(from, "Planning Center data will refresh on your next message.");
+    return;
+  }
 
-    if (!body) return;
+  if (!conversations[from]) conversations[from] = [];
+  conversations[from].push({ role: "user", content: body });
 
-    // Security: only respond to your number
-    if (MY_PHONE && from !== MY_PHONE) return;
+  if (conversations[from].length > 10) {
+    conversations[from] = conversations[from].slice(-10);
+  }
 
-    // Reset command
-    if (["reset", "clear"].includes(body.toLowerCase())) {
-      conversations[from] = [];
-      pcCache = { context: null, fetchedAt: 0 };
-      await sendSignalMessage(from, "Cleared! Fresh start. What do you need?");
-      return;
-    }
+  const pcContext = await getPlanningCenterContext();
 
-    // Refresh command
-    if (body.toLowerCase() === "refresh") {
-      pcCache = { context: null, fetchedAt: 0 };
-      await sendSignalMessage(from, "Planning Center data will refresh on your next message.");
-      return;
-    }
-
-    // Initialize conversation
-    if (!conversations[from]) conversations[from] = [];
-    conversations[from].push({ role: "user", content: body });
-
-    // Keep last 10 messages
-    if (conversations[from].length > 10) {
-      conversations[from] = conversations[from].slice(-10);
-    }
-
-    const pcContext = await getPlanningCenterContext();
-
-    const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": ANTHROPIC_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 800,
-        system: `You are a Production Team AI assistant for a church, accessed via Signal messenger. Help the production director manage their volunteer team.
+  const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": ANTHROPIC_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 800,
+      system: `You are a Production Team AI assistant for a church, accessed via Signal messenger. Help the production director manage their volunteer team.
 
 Live Planning Center data (refreshed every 5 minutes):
 ${pcContext}
 
 Keep responses concise and practical. No markdown formatting — plain text only since this is a messaging app. For drafted messages or detailed lists, longer responses are fine.
 Commands the user can send: RESET (clear history), REFRESH (force Planning Center data update).`,
-        messages: conversations[from].map((m) => ({
-          role: m.role,
-          content: m.content,
-        })),
-      }),
-    });
+      messages: conversations[from].map((m) => ({
+        role: m.role,
+        content: m.content,
+      })),
+    }),
+  });
 
-    const data = await aiRes.json();
-    const reply =
-      data.content
-        ?.filter((c) => c.type === "text")
-        .map((c) => c.text)
-        .join("") || "Sorry, I couldn't respond. Try again.";
+  const data = await aiRes.json();
+  const reply =
+    data.content
+      ?.filter((c) => c.type === "text")
+      .map((c) => c.text)
+      .join("") || "Sorry, I couldn't respond. Try again.";
 
-    conversations[from].push({ role: "assistant", content: reply });
-    await sendSignalMessage(from, reply);
+  conversations[from].push({ role: "assistant", content: reply });
+  await sendSignalMessage(from, reply);
+}
 
-  } catch (e) {
-    console.error("Error handling Signal message:", e);
+// ─── WebSocket connection to signal-cli ──────────────────────────────────────
+function connectWebSocket() {
+  const wsUrl = SIGNAL_API.replace("http://", "ws://").replace("https://", "wss://");
+  const ws = new WebSocket(`${wsUrl}/v1/receive/${SIGNAL_NUMBER}`);
+
+  ws.on("open", () => {
+    console.log("Connected to signal-cli WebSocket");
+  });
+
+  ws.on("message", async (data) => {
     try {
-      const from = req.body?.envelope?.source;
-      if (from) await sendSignalMessage(from, `Something went wrong: ${e.message.slice(0, 100)}`);
-    } catch {}
-  }
-});
+      const msg = JSON.parse(data.toString());
+      console.log("Received Signal message:", JSON.stringify(msg));
+
+      const envelope = msg?.envelope;
+      if (!envelope) return;
+
+      const dataMessage = envelope?.dataMessage;
+      if (!dataMessage) return;
+
+      const from = envelope.source;
+      const body = (dataMessage.message || "").trim();
+
+      await handleMessage(from, body);
+    } catch (e) {
+      console.error("Error processing message:", e);
+    }
+  });
+
+  ws.on("close", () => {
+    console.log("WebSocket closed — reconnecting in 5 seconds...");
+    setTimeout(connectWebSocket, 5000);
+  });
+
+  ws.on("error", (err) => {
+    console.error("WebSocket error:", err.message);
+  });
+}
+
+// Start WebSocket connection after a short delay to let signal-cli initialize
+setTimeout(connectWebSocket, 3000);
 
 // ─── Health check ────────────────────────────────────────────────────────────
 app.get("/", (req, res) => res.send("Production Hub Signal server is running ✓"));
