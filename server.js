@@ -65,15 +65,38 @@ async function getTargetServiceTypes() {
   return all.filter((st) => TARGET_SERVICE_TYPES.includes(st.attributes.name));
 }
 
-// ─── Filter team members to Production team only ─────────────────────────────
-function filterProductionTeam(teamMembers) {
-  const teamNames = [...new Set(teamMembers.map((m) => m.attributes.team_name || "NO_TEAM_NAME"))];
-  console.log("Team names found:", JSON.stringify(teamNames));
-  console.log("Sample member attributes:", JSON.stringify(teamMembers[0]?.attributes));
-  return teamMembers.filter((m) => {
-    const teamName = m.attributes.team_name || "";
-    return teamName.toLowerCase().includes(PRODUCTION_TEAM_NAME.toLowerCase());
-  });
+// ─── Get Production team ID for a plan ───────────────────────────────────────
+async function getProductionTeamId(serviceTypeId, planId) {
+  try {
+    const data = await pcFetch(
+      `/services/v2/service_types/${serviceTypeId}/plans/${planId}/teams?per_page=25`
+    );
+    const teams = data.data || [];
+    console.log("Teams found:", teams.map((t) => t.attributes.name));
+    const prodTeam = teams.find((t) =>
+      t.attributes.name.toLowerCase().includes(PRODUCTION_TEAM_NAME.toLowerCase())
+    );
+    return prodTeam ? prodTeam.id : null;
+  } catch (e) {
+    console.error("Error fetching teams:", e.message);
+    return null;
+  }
+}
+
+// ─── Get only Production team members for a plan ─────────────────────────────
+async function getProductionMembers(serviceTypeId, planId) {
+  const teamId = await getProductionTeamId(serviceTypeId, planId);
+  if (!teamId) {
+    console.log("No Production team found, returning all members");
+    const data = await pcFetch(
+      `/services/v2/service_types/${serviceTypeId}/plans/${planId}/team_members?per_page=100`
+    );
+    return data.data || [];
+  }
+  const data = await pcFetch(
+    `/services/v2/service_types/${serviceTypeId}/plans/${planId}/team_members?filter=team&where[team_id]=${teamId}&per_page=100`
+  );
+  return data.data || [];
 }
 
 // ─── Planning Center Tools ────────────────────────────────────────────────────
@@ -98,11 +121,15 @@ async function getScheduleSummary(productionOnly = false) {
 
       for (const plan of plans.slice(0, 2)) {
         const p = plan.attributes;
-        const teamData = await pcFetch(
-          `/services/v2/service_types/${st.id}/plans/${plan.id}/team_members?per_page=100`
-        );
-        let team = teamData.data || [];
-        if (productionOnly) team = filterProductionTeam(team);
+        let team;
+        if (productionOnly) {
+          team = await getProductionMembers(st.id, plan.id);
+        } else {
+          const teamData = await pcFetch(
+            `/services/v2/service_types/${st.id}/plans/${plan.id}/team_members?per_page=100`
+          );
+          team = teamData.data || [];
+        }
 
         const confirmed   = team.filter((m) => m.attributes.status === "C");
         const unconfirmed = team.filter((m) => m.attributes.status === "U");
@@ -153,11 +180,15 @@ async function getPlanTeam(serviceTypeName, dateHint, productionOnly = true) {
     }
 
     const p = targetPlan.attributes;
-    const teamData = await pcFetch(
-      `/services/v2/service_types/${st.id}/plans/${targetPlan.id}/team_members?per_page=100`
-    );
-    let team = teamData.data || [];
-    if (productionOnly) team = filterProductionTeam(team);
+    let team;
+    if (productionOnly) {
+      team = await getProductionMembers(st.id, targetPlan.id);
+    } else {
+      const teamData = await pcFetch(
+        `/services/v2/service_types/${st.id}/plans/${targetPlan.id}/team_members?per_page=100`
+      );
+      team = teamData.data || [];
+    }
 
     if (!team.length) {
       return productionOnly
